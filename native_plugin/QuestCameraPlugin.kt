@@ -3,6 +3,7 @@ package com.godot.game
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -22,8 +23,15 @@ import android.media.AudioTrack
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
+import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.util.Size
@@ -369,6 +377,66 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     }
 
     @UsedByGodot
+    fun startPttCapture(): String {
+        wispRuntime.startPttCapture()
+        return "ptt_started"
+    }
+
+    @UsedByGodot
+    fun finishPttCapture(): String {
+        val mode = wispRuntime.finishPttCapture()
+        if (mode == "need_android_stt") {
+            val ctx = context ?: run {
+                wispRuntime.pushExternalEvent("ptt_empty")
+                return "no_context"
+            }
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    if (!SpeechRecognizer.isRecognitionAvailable(ctx)) {
+                        wispRuntime.pushExternalEvent("ptt_empty")
+                        return@post
+                    }
+                    val sr = SpeechRecognizer.createSpeechRecognizer(ctx)
+                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
+                        putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                    }
+                    sr.setRecognitionListener(object : RecognitionListener {
+                        override fun onReadyForSpeech(params: Bundle?) {}
+                        override fun onBeginningOfSpeech() {}
+                        override fun onRmsChanged(rmsdB: Float) {}
+                        override fun onBufferReceived(buffer: ByteArray?) {}
+                        override fun onEndOfSpeech() {}
+                        override fun onPartialResults(partialResults: Bundle?) {}
+                        override fun onEvent(eventType: Int, params: Bundle?) {}
+                        override fun onError(error: Int) {
+                            wispRuntime.pushExternalEvent("ptt_empty")
+                            try { sr.destroy() } catch (_: Throwable) {}
+                        }
+                        override fun onResults(results: Bundle?) {
+                            val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            val top = list?.firstOrNull()?.trim() ?: ""
+                            if (top.isNotEmpty()) {
+                                wispRuntime.pushExternalEvent("ptt_transcript", top)
+                            } else {
+                                wispRuntime.pushExternalEvent("ptt_empty")
+                            }
+                            try { sr.destroy() } catch (_: Throwable) {}
+                        }
+                    })
+                    sr.startListening(intent)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Android SpeechRecognizer fallback unavailable: ${t.message}")
+                    wispRuntime.pushExternalEvent("ptt_empty")
+                }
+            }
+            return "android_stt_listening"
+        }
+        return mode
+    }
+
+    @UsedByGodot
     fun speakOrChime(text: String, mood: String): String {
         playMoodChimeAsync(mood)
         if (text.isNotBlank()) {
@@ -377,6 +445,8 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
             }
             if (ttsReadyKo) {
                 try {
+                    val approxMs = (text.length * 145L + 900L).coerceIn(1200L, 16000L)
+                    wispRuntime.markExternalTtsSpeaking(approxMs)
                     ttsEngine?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "utt_${System.currentTimeMillis()}")
                     return "tts_spoken"
                 } catch (t: Throwable) {
@@ -678,6 +748,8 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
         micRunning.set(true)
         micThread = Thread({
             var recorder: AudioRecord? = null
+            var aec: AcousticEchoCanceler? = null
+            var ns: NoiseSuppressor? = null
             try {
                 val minBuf = AudioRecord.getMinBufferSize(
                     SAMPLE_RATE_HZ,
@@ -710,6 +782,15 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
                     return@Thread
                 }
 
+                try {
+                    if (AcousticEchoCanceler.isAvailable()) {
+                        aec = AcousticEchoCanceler.create(recorder.audioSessionId)?.apply { enabled = true }
+                    }
+                    if (NoiseSuppressor.isAvailable()) {
+                        ns = NoiseSuppressor.create(recorder.audioSessionId)?.apply { enabled = true }
+                    }
+                } catch (_: Throwable) {}
+
                 recorder.startRecording()
                 micStatus = "recording_ok"
                 writeHardwareStatusJson()
@@ -731,7 +812,7 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
                         if (rms > 0.020) {
                             voiceSpeakingRecentMs = System.currentTimeMillis()
                         }
-                        wispRuntime.onMicPcm16Chunk(shortBuf, n)
+                        wispRuntime.onMicPcm16Chunk(shortBuf, n, rms)
                         if (localPeak > micPeakAbs) micPeakAbs = localPeak
                         micReadChunks += 1
                         if (micReadChunks == 1 || micReadChunks % 25 == 0) {
@@ -746,6 +827,8 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
                 Log.e(TAG, "Mic capture loop failed", t)
                 writeHardwareStatusJson()
             } finally {
+                try { aec?.release() } catch (_: Throwable) {}
+                try { ns?.release() } catch (_: Throwable) {}
                 try { recorder?.stop() } catch (_: Throwable) {}
                 try { recorder?.release() } catch (_: Throwable) {}
                 micRunning.set(false)
@@ -1316,7 +1399,9 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
         }
 
         for (hb in handBoxes) {
-            if (boxIoU(xmin, ymin, xmax, ymax, hb[0], hb[1], hb[2], hb[3]) > 0.28f) {
+            val hcx = (hb[0] + hb[2]) * 0.5f
+            val hcy = (hb[1] + hb[3]) * 0.5f
+            if (hypot(hcx - 0.5f, hcy - 0.5f) < 0.27f || boxIoU(xmin, ymin, xmax, ymax, hb[0], hb[1], hb[2], hb[3]) > 0.22f) {
                 return null
             }
         }

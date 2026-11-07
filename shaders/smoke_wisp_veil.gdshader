@@ -59,10 +59,10 @@ void vertex() {
 	local_v.x += sin(t * 1.9 - h * 5.2 + seed_offset) * 0.028 * h * h + 0.024 * h * h;
 
 	vec3 body_p = rot_y(local_v, plane_angle_y) + plane_offset;
-	body_p.x -= flight_lean.x * 0.09 * h * h;
-	body_p.z -= flight_lean.y * 0.09 * h * h;
+	vec3 lean_disp = vec3(-flight_lean.x, 0.0, -flight_lean.y) * 0.09 * h * h;
+	body_p += lean_disp;
 
-	vec3 disp = vec3(0.0);
+	vec3 disp = lean_disp;
 	float carve_acc = 0.0;
 	for (int i = 0; i < 8; i++) {
 		float strength = trail_pos_strength[i].w;

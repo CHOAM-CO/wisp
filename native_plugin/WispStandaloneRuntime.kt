@@ -9,6 +9,7 @@ import android.net.Uri
 import android.util.Base64
 import android.util.Log
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -18,7 +19,9 @@ import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
 import java.io.InputStreamReader
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -84,6 +87,14 @@ class WispStandaloneRuntime(
 
     @Volatile private var pkceVerifier: String = ""
     @Volatile private var pkceState: String = ""
+    @Volatile private var discoveredCatalogModels: List<String> = emptyList()
+    @Volatile private var discoveredReasoningEffort: Map<String, String> = emptyMap()
+    @Volatile private var externalTtsSpeakingUntilMs: Long = 0L
+
+    // Push-to-Talk (PTT) PCM16 buffer for noisy hackathon hall / non-realtime voice queries
+    private val pttRecording = AtomicBoolean(false)
+    private val pttLock = Any()
+    private val pttPcmStream = ByteArrayOutputStream()
 
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -176,7 +187,23 @@ class WispStandaloneRuntime(
 
     fun isRealtimeConnected(): Boolean = realtimeRef.get() != null && realtimeState == "connected"
 
-    fun isAssistantSpeaking(): Boolean = System.currentTimeMillis() < assistantSpeakingUntilMs
+    fun isAssistantSpeaking(): Boolean {
+        val now = System.currentTimeMillis()
+        return now < assistantSpeakingUntilMs || now < externalTtsSpeakingUntilMs || playbackQueue.isNotEmpty()
+    }
+
+    fun markExternalTtsSpeaking(durationMs: Long) {
+        val until = System.currentTimeMillis() + durationMs.coerceIn(300L, 18000L)
+        if (until > externalTtsSpeakingUntilMs) {
+            externalTtsSpeakingUntilMs = until
+        }
+    }
+
+    fun pushExternalEvent(type: String, text: String = "") {
+        pushRuntimeEvent(type) {
+            if (text.isNotEmpty()) put("text", text)
+        }
+    }
 
     fun getStateJson(): String {
         val snap = synchronized(authLock) { auth.copy() }
@@ -186,6 +213,7 @@ class WispStandaloneRuntime(
             put("oauthReady", snap.oauthAccessToken.isNotBlank() && snap.oauthAccountId.isNotBlank())
             put("accountIdMasked", maskMiddle(snap.oauthAccountId))
             put("codexModel", snap.codexModel)
+            put("catalogModels", JSONArray(discoveredCatalogModels))
             put("apiKeyReady", snap.openaiApiKey.startsWith("sk-"))
             put("sktAxReady", snap.sktAxApiKey.isNotBlank())
             put("preferSktAx", snap.preferSktAx)
@@ -193,6 +221,7 @@ class WispStandaloneRuntime(
             put("realtimeModel", realtimeModelName)
             put("realtimeError", lastRealtimeError)
             put("assistantSpeaking", isAssistantSpeaking())
+            put("pttRecording", pttRecording.get())
             put("lastUserTranscript", lastUserTranscript)
             put("lastAssistantTranscript", lastAssistantTranscript)
         }.toString()
@@ -227,8 +256,126 @@ class WispStandaloneRuntime(
     // 1. Mic PCM16 -> OpenAI Realtime WebSocket + Barge-In Speaker Playback
     // =========================================================================
 
-    fun onMicPcm16Chunk(samples: ShortArray, count: Int) {
+    fun startPttCapture() {
+        synchronized(pttLock) {
+            pttPcmStream.reset()
+        }
+        pttRecording.set(true)
+    }
+
+    /**
+     * Finishes a Push-to-Talk hold:
+     * - If gpt-realtime is connected, commits the buffered audio & triggers an immediate response.
+     * - Else if an OpenAI API key is set, transcribes the captured PCM16 WAV via /v1/audio/transcriptions
+     *   and emits a `ptt_transcript` runtime event to CompanionAgentRuntime.
+     * - Else returns `"need_android_stt"` so QuestCameraPlugin can invoke Android SpeechRecognizer (`ko-KR`).
+     */
+    fun finishPttCapture(): String {
+        pttRecording.set(false)
+        val pcmBytes = synchronized(pttLock) {
+            val b = pttPcmStream.toByteArray()
+            pttPcmStream.reset()
+            b
+        }
+        val ws = realtimeRef.get()
+        if (ws != null && realtimeState == "connected") {
+            ws.send(JSONObject().put("type", "input_audio_buffer.commit").toString())
+            ws.send(JSONObject().put("type", "response.create").toString())
+            return "realtime_committed"
+        }
+
+        val apiKey = synchronized(authLock) { auth.openaiApiKey }
+        if (apiKey.startsWith("sk-") && pcmBytes.size >= SAMPLE_RATE_HZ / 3 * 2) {
+            workerPool.execute {
+                try {
+                    val wavBytes = wrapPcm16MonoAsWav(pcmBytes, SAMPLE_RATE_HZ)
+                    val multipart = MultipartBody.Builder()
+                        .setType(MultipartBody.FORM)
+                        .addFormDataPart("model", "gpt-4o-mini-transcribe")
+                        .addFormDataPart("language", "ko")
+                        .addFormDataPart(
+                            "file",
+                            "ptt_query.wav",
+                            wavBytes.toRequestBody("audio/wav".toMediaType())
+                        )
+                        .build()
+                    val req = Request.Builder()
+                        .url("$OPENAI_API_BASE/audio/transcriptions")
+                        .header("Authorization", "Bearer $apiKey")
+                        .post(multipart)
+                        .build()
+                    httpClient.newCall(req).execute().use { resp ->
+                        val raw = resp.body?.string() ?: "{}"
+                        if (resp.isSuccessful) {
+                            val txt = JSONObject(raw).optString("text", "").trim()
+                            if (txt.isNotEmpty()) {
+                                lastUserTranscript = txt
+                                pushRuntimeEvent("ptt_transcript") { put("text", txt) }
+                            } else {
+                                pushRuntimeEvent("ptt_empty") {}
+                            }
+                        } else {
+                            Log.w(TAG, "PTT transcription HTTP ${resp.code}: ${raw.take(200)}")
+                            pushRuntimeEvent("ptt_empty") {}
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "PTT transcription failed: ${t.message}")
+                    pushRuntimeEvent("ptt_empty") {}
+                }
+            }
+            return "openai_transcribing"
+        }
+        return "need_android_stt"
+    }
+
+    private fun wrapPcm16MonoAsWav(pcmBytes: ByteArray, sampleRate: Int): ByteArray {
+        val byteRate = sampleRate * 2
+        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put("RIFF".toByteArray(Charsets.US_ASCII))
+            putInt(36 + pcmBytes.size)
+            put("WAVE".toByteArray(Charsets.US_ASCII))
+            put("fmt ".toByteArray(Charsets.US_ASCII))
+            putInt(16)
+            putShort(1) // PCM
+            putShort(1) // Mono
+            putInt(sampleRate)
+            putInt(byteRate)
+            putShort(2) // BlockAlign
+            putShort(16) // BitsPerSample
+            put("data".toByteArray(Charsets.US_ASCII))
+            putInt(pcmBytes.size)
+        }.array()
+        val out = ByteArray(44 + pcmBytes.size)
+        System.arraycopy(header, 0, out, 0, 44)
+        System.arraycopy(pcmBytes, 0, out, 44, pcmBytes.size)
+        return out
+    }
+
+    fun onMicPcm16Chunk(samples: ShortArray, count: Int, rms: Double = 0.0) {
         if (count <= 0) return
+        val byteBuf = ByteBuffer.allocate(count * 2).order(ByteOrder.LITTLE_ENDIAN)
+        // Gate Quest 3 open-ear temple speaker bleed while assistant is speaking unless user speaks loudly (barge-in)
+        val suppressEcho = isAssistantSpeaking() && !pttRecording.get() && rms < 0.058
+        if (suppressEcho) {
+            for (i in 0 until count) {
+                byteBuf.putShort(0)
+            }
+        } else {
+            for (i in 0 until count) {
+                byteBuf.putShort(samples[i])
+            }
+        }
+        val rawBytes = byteBuf.array()
+
+        if (pttRecording.get()) {
+            synchronized(pttLock) {
+                if (pttPcmStream.size() < SAMPLE_RATE_HZ * 2 * 16) {
+                    pttPcmStream.write(rawBytes)
+                }
+            }
+        }
+
         val ws = realtimeRef.get()
         if (ws == null || realtimeState != "connected") {
             if (realtimeDesired.get() && hasOpenAiKey() && !realtimeConnecting.get()) {
@@ -236,11 +383,7 @@ class WispStandaloneRuntime(
             }
             return
         }
-        val byteBuf = ByteBuffer.allocate(count * 2).order(ByteOrder.LITTLE_ENDIAN)
-        for (i in 0 until count) {
-            byteBuf.putShort(samples[i])
-        }
-        val b64 = Base64.encodeToString(byteBuf.array(), Base64.NO_WRAP)
+        val b64 = Base64.encodeToString(rawBytes, Base64.NO_WRAP)
         val msg = JSONObject().apply {
             put("type", "input_audio_buffer.append")
             put("audio", b64)
@@ -506,7 +649,7 @@ class WispStandaloneRuntime(
                 val track = AudioTrack.Builder()
                     .setAudioAttributes(
                         AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build()
                     )
@@ -598,8 +741,22 @@ class WispStandaloneRuntime(
         ensureFreshOAuthToken(force = false)
         val snap = synchronized(authLock) { auth.copy() }
 
+        val modelSlug = snap.codexModel.ifBlank { "gpt-5.4" }
+        var hasWebSearchTool = false
+        for (i in 0 until toolsArr.length()) {
+            val t = toolsArr.optJSONObject(i) ?: continue
+            if (t.optString("type") == "web_search") {
+                hasWebSearchTool = true
+                break
+            }
+        }
+        val includeArr = JSONArray().put("reasoning.encrypted_content").apply {
+            if (hasWebSearchTool) put("web_search_call.action.sources")
+        }
+        val effort = discoveredReasoningEffort[modelSlug] ?: "low"
+
         val bodyJson = JSONObject().apply {
-            put("model", snap.codexModel.ifBlank { "gpt-5.4" })
+            put("model", modelSlug)
             put("instructions", instructions)
             put("input", inputArr)
             put("tools", toolsArr)
@@ -607,8 +764,10 @@ class WispStandaloneRuntime(
             put("parallel_tool_calls", false)
             put("store", false)
             put("stream", true)
-            put("reasoning", JSONObject().put("effort", "low"))
-            put("include", JSONArray().put("reasoning.encrypted_content").put("web_search_call.action.sources"))
+            if (effort.isNotBlank()) {
+                put("reasoning", JSONObject().put("effort", effort))
+            }
+            put("include", includeArr)
         }
 
         val req = Request.Builder()
@@ -739,10 +898,23 @@ class WispStandaloneRuntime(
         if (instructions.isNotBlank()) {
             messages.put(JSONObject().put("role", "system").put("content", instructions))
         }
+        var pendingAssistantToolCalls = JSONArray()
+        fun flushPendingToolCalls() {
+            if (pendingAssistantToolCalls.length() > 0) {
+                messages.put(JSONObject().apply {
+                    put("role", "assistant")
+                    put("content", JSONObject.NULL)
+                    put("tool_calls", pendingAssistantToolCalls)
+                })
+                pendingAssistantToolCalls = JSONArray()
+            }
+        }
+
         for (i in 0 until inputArr.length()) {
             val item = inputArr.optJSONObject(i) ?: continue
             when (item.optString("type", "")) {
                 "message" -> {
+                    flushPendingToolCalls()
                     val role = item.optString("role", "user")
                     val contentArr = item.optJSONArray("content")
                     val sb = StringBuilder()
@@ -769,13 +941,10 @@ class WispStandaloneRuntime(
                             put("arguments", item.optString("arguments", "{}"))
                         })
                     }
-                    messages.put(JSONObject().apply {
-                        put("role", "assistant")
-                        put("content", JSONObject.NULL)
-                        put("tool_calls", JSONArray().put(tc))
-                    })
+                    pendingAssistantToolCalls.put(tc)
                 }
                 "function_call_output" -> {
+                    flushPendingToolCalls()
                     messages.put(JSONObject().apply {
                         put("role", "tool")
                         put("tool_call_id", item.optString("call_id", ""))
@@ -784,6 +953,7 @@ class WispStandaloneRuntime(
                 }
             }
         }
+        flushPendingToolCalls()
 
         val chatTools = JSONArray()
         for (i in 0 until toolsArr.length()) {
@@ -912,19 +1082,21 @@ class WispStandaloneRuntime(
                         )
                     })
                     val snap = synchronized(authLock) { auth.copy() }
-                    val vlmRes = if (snap.oauthAccessToken.isNotBlank() && snap.oauthAccountId.isNotBlank()) {
-                        executeCodexOAuthTurn(
-                            "너는 혼합현실 시선 기억 인덱서야. 사진 속 핵심 사물을 정확하고 간결한 한국어 한 문장으로 기록해.",
-                            inputArr,
-                            JSONArray()
-                        )
-                    } else {
-                        executeOpenAiResponsesTurn(
-                            snap.openaiApiKey,
-                            "너는 혼합현실 시선 기억 인덱서야. 사진 속 핵심 사물을 정확하고 간결한 한국어 한 문장으로 기록해.",
-                            inputArr,
-                            JSONArray()
-                        )
+                    val vlmRes = when {
+                        snap.oauthAccessToken.isNotBlank() && snap.oauthAccountId.isNotBlank() ->
+                            executeCodexOAuthTurn(
+                                "너는 혼합현실 시선 기억 인덱서야. 사진 속 핵심 사물을 정확하고 간결한 한국어 한 문장으로 기록해.",
+                                inputArr,
+                                JSONArray()
+                            )
+                        snap.openaiApiKey.startsWith("sk-") ->
+                            executeOpenAiResponsesTurn(
+                                snap.openaiApiKey,
+                                "너는 혼합현실 시선 기억 인덱서야. 사진 속 핵심 사물을 정확하고 간결한 한국어 한 문장으로 기록해.",
+                                inputArr,
+                                JSONArray()
+                            )
+                        else -> JSONObject().put("ok", false)
                     }
                     if (vlmRes.optBoolean("ok", false)) {
                         annotation = vlmRes.optString("assistantText", "").trim()
@@ -1126,18 +1298,43 @@ class WispStandaloneRuntime(
                 if (!resp.isSuccessful) return
                 val data = JSONObject(resp.body?.string() ?: return)
                 val models = data.optJSONArray("models") ?: return
-                val slugs = mutableListOf<String>()
+                data class CatalogItem(val slug: String, val priority: Int, val bestEffort: String)
+                val items = mutableListOf<CatalogItem>()
                 for (i in 0 until models.length()) {
                     val m = models.optJSONObject(i) ?: continue
-                    val slug = m.optString("slug", "")
-                    if (slug.isNotBlank()) slugs.add(slug)
+                    val slug = m.optString("slug", "").trim()
+                    if (slug.isBlank()) continue
+                    val vis = m.optString("visibility", "list")
+                    if (vis != "list" && vis.isNotBlank()) continue
+                    val prio = m.optInt("priority", 9999)
+                    val levels = m.optJSONArray("supported_reasoning_levels")
+                    val supportedEfforts = mutableListOf<String>()
+                    if (levels != null) {
+                        for (j in 0 until levels.length()) {
+                            val lv = levels.optJSONObject(j)
+                            val ef = (lv?.optString("effort", "") ?: levels.optString(j, "")).trim()
+                            if (ef.isNotBlank()) supportedEfforts.add(ef)
+                        }
+                    }
+                    val defEff = m.optString("default_reasoning_level", "").trim()
+                    val bestEff = when {
+                        "low" in supportedEfforts -> "low"
+                        defEff.isNotBlank() -> defEff
+                        supportedEfforts.isNotEmpty() -> supportedEfforts.first()
+                        else -> ""
+                    }
+                    items.add(CatalogItem(slug, prio, bestEff))
                 }
-                val chosen = listOf("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2").firstOrNull { it in slugs }
-                    ?: slugs.firstOrNull()
-                if (!chosen.isNullOrBlank()) {
+                items.sortBy { it.priority }
+                val slugs = items.map { it.slug }
+                if (slugs.isNotEmpty()) {
+                    discoveredCatalogModels = slugs
+                    discoveredReasoningEffort = items.associate { it.slug to it.bestEffort }
+                    val current = synchronized(authLock) { auth.codexModel }
+                    val chosen = if (current in slugs) current else slugs.first()
                     synchronized(authLock) { auth.codexModel = chosen }
                     saveAuthToDisk()
-                    Log.i(TAG, "Discovered Codex OAuth model: $chosen (out of ${slugs.size})")
+                    Log.i(TAG, "Discovered Codex OAuth catalog: active=$chosen, available=$slugs")
                 }
             }
         } catch (t: Throwable) {
@@ -1185,12 +1382,17 @@ class WispStandaloneRuntime(
         if (!serverRunning.compareAndSet(false, true)) return
         serverThread = Thread({
             try {
-                val srv = ServerSocket(LOOPBACK_PORT, 16, InetAddress.getByName("127.0.0.1"))
+                // Dual-stack bind so Quest Browser works whether `localhost` resolves to [::1] or 127.0.0.1
+                val srv = ServerSocket(LOOPBACK_PORT, 16)
                 serverSocket = srv
                 serverListening = true
-                Log.i(TAG, "Loopback Setup & OAuth server listening on $SETUP_URL")
+                Log.i(TAG, "Loopback Setup & OAuth server listening on $SETUP_URL (dual-stack loopback guarded)")
                 while (serverRunning.get()) {
                     val client = try { srv.accept() } catch (_: Throwable) { break }
+                    if (client.inetAddress?.isLoopbackAddress != true) {
+                        try { client.close() } catch (_: Throwable) {}
+                        continue
+                    }
                     workerPool.execute { handleHttpClient(client) }
                 }
             } catch (t: Throwable) {
@@ -1207,12 +1409,28 @@ class WispStandaloneRuntime(
         serverSocket = null
     }
 
+    private fun readHttpHeaderLine(inp: InputStream): String? {
+        val sb = ByteArrayOutputStream(128)
+        while (sb.size() < 8192) {
+            val b = inp.read()
+            if (b < 0) {
+                return if (sb.size() == 0) null else sb.toString("UTF-8")
+            }
+            if (b == '\n'.code) {
+                val arr = sb.toByteArray()
+                val len = if (arr.isNotEmpty() && arr[arr.size - 1] == '\r'.code.toByte()) arr.size - 1 else arr.size
+                return String(arr, 0, len, Charsets.UTF_8)
+            }
+            sb.write(b)
+        }
+        return sb.toString("UTF-8")
+    }
+
     private fun handleHttpClient(socket: Socket) {
         socket.use { sock ->
             sock.soTimeout = 10000
             val inp = sock.getInputStream()
-            val reader = BufferedReader(InputStreamReader(inp, Charsets.UTF_8))
-            val reqLine = reader.readLine() ?: return
+            val reqLine = readHttpHeaderLine(inp) ?: return
             val parts = reqLine.split(" ")
             if (parts.size < 2) return
             val method = parts[0].uppercase()
@@ -1223,22 +1441,22 @@ class WispStandaloneRuntime(
 
             var contentLen = 0
             while (true) {
-                val h = reader.readLine() ?: break
+                val h = readHttpHeaderLine(inp) ?: break
                 if (h.isEmpty()) break
                 if (h.startsWith("Content-Length:", ignoreCase = true)) {
                     contentLen = h.substringAfter(":").trim().toIntOrNull() ?: 0
                 }
             }
 
-            val bodyChars = if (contentLen in 1..262144) {
-                val buf = CharArray(contentLen)
+            val bodyStr = if (contentLen in 1..262144) {
+                val buf = ByteArray(contentLen)
                 var readTotal = 0
                 while (readTotal < contentLen) {
-                    val r = reader.read(buf, readTotal, contentLen - readTotal)
+                    val r = inp.read(buf, readTotal, contentLen - readTotal)
                     if (r <= 0) break
                     readTotal += r
                 }
-                String(buf, 0, readTotal)
+                String(buf, 0, readTotal, Charsets.UTF_8)
             } else ""
 
             when {
@@ -1287,16 +1505,20 @@ class WispStandaloneRuntime(
                     }
                 }
                 method == "POST" && path == "/setup/save" -> {
-                    val form = parseFormEncoded(bodyChars)
+                    val form = parseFormEncoded(bodyStr)
                     val authJsonRaw = (form["auth_json"] ?: "").trim()
                     val openAiKey = (form["openai_api_key"] ?: "").trim()
                     val sktKey = (form["skt_ax_key"] ?: "").trim()
+                    val selectedModel = (form["codex_model"] ?: "").trim()
                     val preferAx = (form["prefer_skt_ax"] == "on")
 
                     if (authJsonRaw.isNotEmpty()) {
                         importAuthJsonString(authJsonRaw)
                     }
                     synchronized(authLock) {
+                        if (selectedModel.isNotEmpty()) {
+                            auth.codexModel = selectedModel
+                        }
                         if (openAiKey.isNotEmpty() && !openAiKey.contains("••••")) {
                             auth.openaiApiKey = openAiKey
                         }
@@ -1314,13 +1536,17 @@ class WispStandaloneRuntime(
                     writeRedirect(sock, "/setup?msg=saved")
                 }
                 method == "POST" && path == "/setup/say" -> {
-                    val form = parseFormEncoded(bodyChars)
+                    val form = parseFormEncoded(bodyStr)
                     val prompt = (form["prompt"] ?: "").trim()
                     if (prompt.isNotEmpty()) {
                         lastUserTranscript = prompt
                         pushRuntimeEvent("web_prompt") { put("text", prompt) }
                     }
                     writeRedirect(sock, "/setup?msg=sent")
+                }
+                method == "POST" && path == "/setup/reset" -> {
+                    pushRuntimeEvent("web_reset") {}
+                    writeRedirect(sock, "/setup?msg=reset_ok")
                 }
                 method == "POST" && path == "/setup/logout" -> {
                     synchronized(authLock) { auth = StoredAuth() }
@@ -1431,10 +1657,17 @@ class WispStandaloneRuntime(
             "✅ SKT A.X K2 연결 준비됨 (${if (snap.preferSktAx) "주 응답 활성" else "대기"})"
         else "⚪ 선택 입력"
 
+        val modelPool = (discoveredCatalogModels + listOf(snap.codexModel, "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex")).filter { it.isNotBlank() }.distinct()
+        val modelOptionsHtml = modelPool.joinToString("") { m ->
+            val sel = if (m == snap.codexModel) " selected" else ""
+            "<option value=\"$m\"$sel>$m</option>"
+        }
+
         val banner = when (msgCode) {
             "oauth_ok" -> "<div class='ok'>ChatGPT 구독 OAuth 로그인이 완료됐어! 이제 헤드셋 단독으로 위습 세션이 동작해.</div>"
             "saved" -> "<div class='ok'>설정이 저장됐어! 옆에 떠 있는 위습과 바로 대화해 봐.</div>"
             "sent" -> "<div class='ok'>위습에게 메시지를 보냈어!</div>"
+            "reset_ok" -> "<div class='ok'>위습의 시선 기억과 대화 세션을 초기화했어!</div>"
             "cleared" -> "<div class='warn'>저장된 인증 정보를 초기화했어.</div>"
             "oauth_exchange_err", "oauth_state_err" -> "<div class='warn'>OAuth 토큰 교환에 실패했어. 다시 로그인 버튼을 누르거나 auth.json을 붙여넣어 줘.</div>"
             else -> ""
@@ -1456,8 +1689,8 @@ class WispStandaloneRuntime(
                 .sub{font-size:13px;color:#9bb0ce;margin-bottom:14px}
                 .stat{font-size:14px;margin:6px 0;padding:8px 12px;background:#0d1424;border-radius:10px}
                 .btn{display:inline-block;background:linear-gradient(135deg,#2dd4bf,#38bdf8);color:#06121e;font-weight:700;padding:12px 18px;border-radius:12px;text-decoration:none;border:none;font-size:15px;cursor:pointer}
-                .btn-sec{background:#23324d;color:#d9e8ff;font-weight:600;padding:10px 15px;border-radius:10px;border:1px solid #354b73;cursor:pointer}
-                input[type=text],input[type=password],textarea{width:100%;box-sizing:border-box;background:#0b1220;color:#eaf2ff;border:1px solid #2b3f63;border-radius:10px;padding:10px 12px;font-size:14px;margin-top:6px;margin-bottom:12px}
+                .btn-sec{background:#23324d;color:#d9e8ff;font-weight:600;padding:10px 15px;border-radius:10px;border:1px solid #354b73;cursor:pointer;margin-right:8px}
+                input[type=text],input[type=password],select,textarea{width:100%;box-sizing:border-box;background:#0b1220;color:#eaf2ff;border:1px solid #2b3f63;border-radius:10px;padding:10px 12px;font-size:14px;margin-top:6px;margin-bottom:12px}
                 textarea{min-height:84px;font-family:monospace;font-size:12px}
                 .ok{background:#11382f;border:1px solid #2dd4bf;color:#a7f3d0;padding:10px 14px;border-radius:12px;margin-bottom:14px;font-size:14px}
                 .warn{background:#3b1d2a;border:1px solid #f472b6;color:#fbcfe8;padding:10px 14px;border-radius:12px;margin-bottom:14px;font-size:14px}
@@ -1482,8 +1715,11 @@ class WispStandaloneRuntime(
                 </div>
 
                 <div class="card">
-                  <h2>2. 실시간 음성(gpt-realtime) · API 키 · auth.json 설정</h2>
+                  <h2>2. 모델 · 실시간 음성(gpt-realtime) · API 키 설정</h2>
                   <form method="POST" action="/setup/save">
+                    <label>ChatGPT OAuth 컴패니언 모델 (자동 카탈로그 탐색 반영)</label>
+                    <select name="codex_model">$modelOptionsHtml</select>
+
                     <label>OpenAI API Key (gpt-realtime 양방향 음성 + text-embedding-3-small 768d)</label>
                     <input type="password" name="openai_api_key" placeholder="${if (snap.openaiApiKey.isNotBlank()) "저장됨 (변경 시 새 sk-... 입력)" else "sk-..."}" />
 
@@ -1501,16 +1737,44 @@ class WispStandaloneRuntime(
                 </div>
 
                 <div class="card">
-                  <h2>3. 2D 창에서 위습에게 바로 말 걸기 (테스트/텍스트 입력)</h2>
-                  <form method="POST" action="/setup/say">
-                    <input type="text" name="prompt" placeholder="예: 내가 방금 유심히 본 물건 기억나? 어울리는 거 딱 2개만 추천해줘!" />
+                  <h2>3. 2D 창에서 위습에게 바로 말 걸기 (음성 / 텍스트 입력)</h2>
+                  <form id="sayForm" method="POST" action="/setup/say">
+                    <input id="promptInput" type="text" name="prompt" placeholder="예: 내가 방금 유심히 본 물건 기억나? 어울리는 거 딱 2개만 추천해줘!" />
                     <button class="btn-sec" type="submit">위습에게 보내기</button>
+                    <button class="btn-sec" type="button" id="micBtn">🎤 음성으로 말하기</button>
                   </form>
-                  <form method="POST" action="/setup/logout" style="margin-top:12px">
-                    <button class="btn-sec" type="submit">인증 정보 초기화</button>
-                  </form>
+                  <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+                    <form method="POST" action="/setup/reset">
+                      <button class="btn-sec" type="submit">시선 기억·대화 리셋</button>
+                    </form>
+                    <form method="POST" action="/setup/logout">
+                      <button class="btn-sec" type="submit">인증 정보 초기화</button>
+                    </form>
+                  </div>
                 </div>
               </div>
+              <script>
+                (function(){
+                  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+                  var btn = document.getElementById('micBtn');
+                  var inp = document.getElementById('promptInput');
+                  var frm = document.getElementById('sayForm');
+                  if (!SR || !btn) { if (btn) btn.style.display = 'none'; return; }
+                  btn.onclick = function() {
+                    var rec = new SR();
+                    rec.lang = 'ko-KR';
+                    rec.interimResults = false;
+                    btn.textContent = '🎙 듣는 중...';
+                    rec.onresult = function(e) {
+                      var txt = e.results[0][0].transcript || '';
+                      if (txt.trim()) { inp.value = txt.trim(); frm.submit(); }
+                    };
+                    rec.onerror = function() { btn.textContent = '🎤 음성으로 말하기'; };
+                    rec.onend = function() { btn.textContent = '🎤 음성으로 말하기'; };
+                    rec.start();
+                  };
+                })();
+              </script>
             </body>
             </html>
         """.trimIndent()

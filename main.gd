@@ -42,6 +42,12 @@ var openxr_bare_left_active: bool = false
 var openxr_bare_right_active: bool = false
 var rgb_hand_active: bool = false
 var y_hold_timer: float = -1.0
+var y_ptt_active: bool = false
+var left_x_held: bool = false
+var left_y_held: bool = false
+var combo_reset_timer: float = 0.0
+var combo_reset_fired: bool = false
+var ray_click_queued: bool = false
 
 # 공간 룬 독 (A 시선 / B 기억 / X 모드 / Y 대화 / ⚙ 설정) — 홈 기준 고정으로 도망 중에도 터치 안정성 확보
 var spirit_runes_root: Node3D
@@ -85,6 +91,8 @@ var debug_memory_panel: Node3D
 var xray_text_label: Label3D
 var xray_crop_mesh: MeshInstance3D
 var xray_crop_mat: StandardMaterial3D
+var xray_badge_mat: StandardMaterial3D
+var xray_badge_label: Label3D
 
 var vision_poll_timer: float = 0.0
 var latest_vision_state: Dictionary = {}
@@ -137,6 +145,7 @@ func _ready() -> void:
 	companion_agent.assistant_replied.connect(_on_assistant_replied)
 	companion_agent.agent_status_changed.connect(_on_agent_status_changed)
 	companion_agent.auth_required_prompt.connect(_on_auth_required_prompt)
+	companion_agent.web_reset_requested.connect(_action_reset_demo)
 
 	_setup_environment()
 	_build_smoke_spirit()
@@ -248,22 +257,50 @@ func _on_right_button_pressed(btn_name: String) -> void:
 		_action_toggle_vision_bbox()
 	elif btn_name == "by_button":
 		_action_toggle_memory_xray()
+	elif btn_name == "trigger_click":
+		ray_click_queued = true
 
 
 func _on_left_button_pressed(btn_name: String) -> void:
 	if btn_name == "ax_button":
-		_action_toggle_demo_mode()
+		left_x_held = true
+		combo_reset_fired = false
 	elif btn_name == "by_button":
+		left_y_held = true
+		combo_reset_fired = false
 		y_hold_timer = 0.0
+		y_ptt_active = false
+	elif btn_name == "trigger_click":
+		ray_click_queued = true
 	elif btn_name == "menu_button":
 		_action_open_setup_browser()
 
 
 func _on_left_button_released(btn_name: String) -> void:
-	if btn_name == "by_button":
-		if y_hold_timer >= 0.0 and y_hold_timer < 1.1:
+	if btn_name == "ax_button":
+		var should_toggle: bool = left_x_held and not combo_reset_fired
+		left_x_held = false
+		combo_reset_timer = 0.0
+		if should_toggle:
+			_action_toggle_demo_mode()
+	elif btn_name == "by_button":
+		left_y_held = false
+		combo_reset_timer = 0.0
+		if combo_reset_fired:
+			y_hold_timer = -1.0
+			y_ptt_active = false
+			return
+		if y_ptt_active:
+			y_ptt_active = false
+			y_hold_timer = -1.0
+			if cam_plugin != null:
+				var stt_mode: String = str(cam_plugin.call("finishPttCapture"))
+				_show_toast("음성 질문 처리 중 (%s)" % stt_mode, 1.8)
+			else:
+				_action_trigger_query("컨트롤러 Y PTT")
+		elif y_hold_timer >= 0.0:
+			y_hold_timer = -1.0
 			_action_trigger_query("컨트롤러 Y")
-		y_hold_timer = -1.0
 
 
 func _action_toggle_vision_bbox() -> void:
@@ -728,21 +765,21 @@ func _build_debug_overlays() -> void:
 	debug_memory_panel.position = Vector3(-0.24, 1.70, -1.04)
 	add_child(debug_memory_panel)
 
-	var mem_bg := _make_panel_bg(0.66, 0.39, Color(0.06, 0.05, 0.14, 0.90), -4)
+	var mem_bg := _make_panel_bg(0.74, 0.44, Color(0.06, 0.05, 0.14, 0.90), -4)
 	debug_memory_panel.add_child(mem_bg)
 
-	var mem_hdr := _make_panel_bg(0.66, 0.042, Color(0.36, 0.24, 0.68, 0.92), -2)
-	mem_hdr.position = Vector3(0.0, 0.174, 0.006)
+	var mem_hdr := _make_panel_bg(0.74, 0.042, Color(0.36, 0.24, 0.68, 0.92), -2)
+	mem_hdr.position = Vector3(0.0, 0.199, 0.006)
 	debug_memory_panel.add_child(mem_hdr)
 
 	var mem_title := _make_label(16, 0.00094, 3)
 	mem_title.text = "[X-RAY] 실시간 기억 승격 · 하이브리드 검색 · 단독 세션 상태"
-	mem_title.position = Vector3(0.0, 0.174, 0.012)
+	mem_title.position = Vector3(0.0, 0.199, 0.012)
 	debug_memory_panel.add_child(mem_title)
 
 	xray_crop_mesh = MeshInstance3D.new()
 	var xq := QuadMesh.new()
-	xq.size = Vector2(0.095, 0.078)
+	xq.size = Vector2(0.098, 0.080)
 	xray_crop_mesh.mesh = xq
 	xray_crop_mat = StandardMaterial3D.new()
 	xray_crop_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
@@ -750,13 +787,25 @@ func _build_debug_overlays() -> void:
 	xray_crop_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 	xray_crop_mat.render_priority = -1
 	xray_crop_mesh.material_override = xray_crop_mat
-	xray_crop_mesh.position = Vector3(-0.265, 0.098, 0.010)
+	xray_crop_mesh.position = Vector3(-0.305, 0.118, 0.010)
 	debug_memory_panel.add_child(xray_crop_mesh)
 
-	xray_text_label = _make_label(14, 0.00088, 3)
+	var badge_pill := _make_panel_bg(0.102, 0.026, Color(0.26, 0.24, 0.44, 0.92), -1)
+	badge_pill.position = Vector3(-0.305, 0.058, 0.010)
+	xray_badge_mat = badge_pill.material_override as StandardMaterial3D
+	debug_memory_panel.add_child(badge_pill)
+
+	xray_badge_label = _make_label(12, 0.00080, 4)
+	xray_badge_label.text = "감각버퍼 대기"
+	xray_badge_label.position = Vector3(-0.305, 0.058, 0.016)
+	debug_memory_panel.add_child(xray_badge_label)
+
+	xray_text_label = _make_label(14, 0.00086, 3)
 	xray_text_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	xray_text_label.vertical_alignment = VERTICAL_ALIGNMENT_TOP
-	xray_text_label.position = Vector3(-0.205, 0.140, 0.012)
+	xray_text_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	xray_text_label.width = 615.0
+	xray_text_label.position = Vector3(-0.242, 0.165, 0.012)
 	debug_memory_panel.add_child(xray_text_label)
 
 
@@ -1121,12 +1170,23 @@ func _refresh_xray_panel() -> void:
 	var latest_model_badge: String = "-"
 	if memory_engine.memories.size() > 0:
 		var m0: Dictionary = memory_engine.memories[0]
-		var tier_s: String = "★장기승격" if str(m0.get("tier", "")) == "long_term" else "중단기"
+		var is_long: bool = str(m0.get("tier", "")) == "long_term"
+		var tier_s: String = "★장기승격" if is_long else "중단기"
 		latest_annot = "[%s|%s] %s" % [str(m0.get("id", "")), tier_s, str(m0.get("annotation", ""))]
 		latest_model_badge = "%s + %s" % [str(m0.get("vlm_model", "")), str(m0.get("embed_model", ""))]
 		var cp: String = str(m0.get("crop_path", ""))
 		if cp != "":
 			_update_crop_textures(cp)
+		if xray_badge_label != null and xray_badge_mat != null:
+			if int(counts["long_term"]) > 0 or is_long:
+				xray_badge_label.text = "★ 장기기억 승격됨"
+				xray_badge_mat.albedo_color = Color(0.68, 0.48, 0.10, 0.95)
+			else:
+				xray_badge_label.text = "중기 인덱싱 완료"
+				xray_badge_mat.albedo_color = Color(0.24, 0.42, 0.68, 0.92)
+	elif xray_badge_label != null and xray_badge_mat != null:
+		xray_badge_label.text = "감각버퍼 대기"
+		xray_badge_mat.albedo_color = Color(0.26, 0.24, 0.44, 0.92)
 
 	var sr: Dictionary = memory_engine.last_search_result
 	var vec_lines: Array[String] = []
@@ -1244,15 +1304,51 @@ func _update_bare_hand_tracker(
 	return out
 
 
+func _ray_hits_point(ray_origin: Vector3, ray_dir: Vector3, target_pos: Vector3, radius: float) -> bool:
+	var n_dir: Vector3 = ray_dir.normalized()
+	if n_dir.length_squared() < 0.001:
+		return false
+	var to_t: Vector3 = target_pos - ray_origin
+	var proj: float = to_t.dot(n_dir)
+	if proj < 0.06 or proj > 2.4:
+		return false
+	return (ray_origin + n_dir * proj).distance_to(target_pos) <= radius
+
+
+func _execute_rune_key(k: String, source_tag: String = "맨손룬Y") -> void:
+	if k == "A":
+		_action_toggle_vision_bbox()
+	elif k == "B":
+		_action_toggle_memory_xray()
+	elif k == "X":
+		_action_toggle_demo_mode()
+	elif k == "Y":
+		_action_trigger_query(source_tag)
+	elif k == "S":
+		_action_open_setup_browser()
+
+
 func _process_hands_and_pointers(delta: float) -> Variant:
 	if rune_cooldown > 0.0:
 		rune_cooldown = maxf(0.0, rune_cooldown - delta)
 
-	if y_hold_timer >= 0.0:
-		y_hold_timer += delta
-		if y_hold_timer >= 1.15:
+	# 왼손 X + Y 동시 1.1초 홀드 시 데모 기억·대화 리셋 (단독 Y 홀드 PTT와 절대 충돌하지 않음)
+	if left_x_held and left_y_held and not combo_reset_fired:
+		combo_reset_timer += delta
+		if combo_reset_timer >= 1.1:
+			combo_reset_fired = true
+			combo_reset_timer = 0.0
 			y_hold_timer = -1.0
+			y_ptt_active = false
 			_action_reset_demo()
+	elif y_hold_timer >= 0.0 and not left_x_held:
+		y_hold_timer += delta
+		if not y_ptt_active and y_hold_timer >= 0.38:
+			y_ptt_active = true
+			if cam_plugin != null:
+				cam_plugin.call("startPttCapture")
+			_speak_or_chime("", "pinch")
+			_show_toast("음성 듣는 중... 말하고 Y 버튼을 떼면 전송돼!", 4.5)
 
 	var left_info: Dictionary = _update_bare_hand_tracker(&"/user/hand_tracker/left", bare_hand_joints_left, false)
 	var right_info: Dictionary = _update_bare_hand_tracker(&"/user/hand_tracker/right", bare_hand_joints_right, true)
@@ -1265,6 +1361,7 @@ func _process_hands_and_pointers(delta: float) -> Variant:
 	var poke_points: Array[Vector3] = []
 	var named_hand_points: Dictionary = {}
 	var active_rays: Array[Dictionary] = []
+	var click_rays: Array[Dictionary] = []
 
 	pointer_beam_left.visible = false
 	pointer_beam_right.visible = false
@@ -1276,17 +1373,21 @@ func _process_hands_and_pointers(delta: float) -> Variant:
 		named_hand_points["left_palm"] = l_pts[0]
 		named_hand_points["left_index"] = l_pts[2]
 		named_hand_points["left_middle"] = l_pts[3]
+		var lo: Vector3 = left_info["ray_origin"]
+		var ld: Vector3 = left_info["ray_dir"]
 		if bool(left_info["is_pointing_ray"]):
-			var lo: Vector3 = left_info["ray_origin"]
-			var ld: Vector3 = left_info["ray_dir"]
 			active_rays.append({"origin": lo, "dir": ld, "source": "왼손 검지 포인터"})
 			_update_beam_visual(pointer_beam_left, lo, ld, 1.15)
+		if bool(left_info["pinch_just_pressed"]):
+			click_rays.append({"origin": lo, "dir": ld, "tag": "왼손핀치레이"})
 	elif left_hand.get_is_active():
 		poke_points.append(left_hand.global_position)
 		named_hand_points["left_ctrl"] = left_hand.global_position
 		var l_dir: Vector3 = -left_hand.global_transform.basis.z.normalized()
 		active_rays.append({"origin": left_hand.global_position, "dir": l_dir, "source": "왼손 컨트롤러 포인터"})
 		_update_beam_visual(pointer_beam_left, left_hand.global_position, l_dir, 1.25)
+		if ray_click_queued:
+			click_rays.append({"origin": left_hand.global_position, "dir": l_dir, "tag": "컨트롤러트리거"})
 
 	# 오른손 입력 & 포인터 광선
 	if openxr_bare_right_active:
@@ -1295,17 +1396,23 @@ func _process_hands_and_pointers(delta: float) -> Variant:
 		named_hand_points["right_palm"] = r_pts[0]
 		named_hand_points["right_index"] = r_pts[2]
 		named_hand_points["right_middle"] = r_pts[3]
+		var ro: Vector3 = right_info["ray_origin"]
+		var rd: Vector3 = right_info["ray_dir"]
 		if bool(right_info["is_pointing_ray"]):
-			var ro: Vector3 = right_info["ray_origin"]
-			var rd: Vector3 = right_info["ray_dir"]
 			active_rays.append({"origin": ro, "dir": rd, "source": "오른손 검지 포인터"})
 			_update_beam_visual(pointer_beam_right, ro, rd, 1.15)
+		if bool(right_info["pinch_just_pressed"]):
+			click_rays.append({"origin": ro, "dir": rd, "tag": "오른손핀치레이"})
 	elif right_hand.get_is_active():
 		poke_points.append(right_hand.global_position)
 		named_hand_points["right_ctrl"] = right_hand.global_position
 		var r_dir: Vector3 = -right_hand.global_transform.basis.z.normalized()
 		active_rays.append({"origin": right_hand.global_position, "dir": r_dir, "source": "오른손 컨트롤러 포인터"})
 		_update_beam_visual(pointer_beam_right, right_hand.global_position, r_dir, 1.25)
+		if ray_click_queued:
+			click_rays.append({"origin": right_hand.global_position, "dir": r_dir, "tag": "컨트롤러트리거"})
+
+	ray_click_queued = false
 
 	# RGB 카메라 기반 MediaPipe 손 인식 3D 투영 (보조/백업 손 추적)
 	rgb_hand_active = false
@@ -1348,6 +1455,37 @@ func _process_hands_and_pointers(delta: float) -> Variant:
 	spirit.ingest_pointer_rays(active_rays, xr_camera.global_transform, delta)
 	spirit.ingest_hand_points(named_hand_points, delta)
 
+	# 원거리 레이 포인터 + 트리거/핀치 클릭 (앉은 자세에서도 룬·카드 버튼 즉시 클릭 가능)
+	if click_rays.size() > 0 and rune_cooldown <= 0.0:
+		for cr: Dictionary in click_rays:
+			var co: Vector3 = cr["origin"]
+			var cd: Vector3 = cr["dir"]
+			for r: Dictionary in rune_items:
+				var holder: Node3D = r["holder"]
+				if _ray_hits_point(co, cd, holder.global_position, 0.052):
+					rune_cooldown = RUNE_COOLDOWN_SEC
+					_execute_rune_key(str(r["key"]), str(cr["tag"]))
+					return null
+			if dialogue_card_root.visible and _ray_hits_point(co, cd, dialogue_close_btn.global_position, 0.055):
+				rune_cooldown = RUNE_COOLDOWN_SEC
+				dialogue_card_root.visible = false
+				_speak_or_chime("", "pinch")
+				return null
+			if rec_card_root.visible:
+				for rb: Dictionary in rec_buttons:
+					var bnode: Node3D = rb["node"]
+					if _ray_hits_point(co, cd, bnode.global_position, 0.062):
+						rune_cooldown = RUNE_COOLDOWN_SEC
+						var bid: String = str(rb["id"])
+						if bid == "close":
+							rec_card_root.visible = false
+							_speak_or_chime("", "pinch")
+						elif bid == "web1":
+							_open_product_search_2d(rec_item1_query, 1)
+						elif bid == "web2":
+							_open_product_search_2d(rec_item2_query, 2)
+						return null
+
 	# 오른손 맨손 핀치 -> 정령 근처에서 대화/추천 즉시 실행
 	if bool(right_info["pinch_just_pressed"]) and rune_cooldown <= 0.0:
 		var r_tip: Vector3 = right_info["index_tip"]
@@ -1356,6 +1494,10 @@ func _process_hands_and_pointers(delta: float) -> Variant:
 			_action_trigger_query("맨손핀치")
 
 	var any_near_runes: bool = false
+	for ar: Dictionary in active_rays:
+		if _ray_hits_point(ar["origin"], ar["dir"], spirit_runes_root.global_position, 0.24):
+			any_near_runes = true
+			break
 	var closest_hand_pt: Variant = null
 	var closest_d: float = 999.0
 
@@ -1373,17 +1515,7 @@ func _process_hands_and_pointers(delta: float) -> Variant:
 				var holder: Node3D = r["holder"]
 				if pt.distance_to(holder.global_position) < 0.038:
 					rune_cooldown = RUNE_COOLDOWN_SEC
-					var k: String = str(r["key"])
-					if k == "A":
-						_action_toggle_vision_bbox()
-					elif k == "B":
-						_action_toggle_memory_xray()
-					elif k == "X":
-						_action_toggle_demo_mode()
-					elif k == "Y":
-						_action_trigger_query("맨손룬Y")
-					elif k == "S":
-						_action_open_setup_browser()
+					_execute_rune_key(str(r["key"]), "맨손룬Y")
 					return closest_hand_pt
 
 		if dialogue_card_root.visible and rune_cooldown <= 0.0:

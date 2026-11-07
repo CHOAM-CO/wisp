@@ -7,6 +7,7 @@ signal spirit_action_requested(action: String, mood: String)
 signal assistant_replied(text: String, backend: String, from_realtime_delegate: bool)
 signal agent_status_changed(busy: bool, summary: String)
 signal auth_required_prompt(reason: String)
+signal web_reset_requested()
 
 const MAX_TOOL_STEPS: int = 5
 const MAX_HISTORY_ITEMS: int = 34
@@ -17,6 +18,7 @@ var vision_state_provider: Callable = Callable()
 
 var conversation_items: Array[Dictionary] = []
 var active_turns: Dictionary = {}
+var _pending_turn_queue: Array[Dictionary] = []
 var _turn_seq: int = 1
 var is_busy: bool = false
 var last_backend_used: String = "대기"
@@ -48,6 +50,7 @@ func setup(mem_engine, plugin_ref: Object, vis_provider: Callable) -> void:
 func reset_conversation() -> void:
 	conversation_items.clear()
 	active_turns.clear()
+	_pending_turn_queue.clear()
 	is_busy = false
 	last_error = ""
 	agent_status_changed.emit(false, "세션 초기화됨")
@@ -117,6 +120,14 @@ func _handle_runtime_event(evt: Dictionary) -> void:
 			var txt: String = str(evt.get("text", "")).strip_edges()
 			if txt != "":
 				request_user_turn(txt)
+		"ptt_transcript":
+			var pt_txt: String = str(evt.get("text", "")).strip_edges()
+			if pt_txt != "":
+				request_user_turn(pt_txt)
+		"ptt_empty":
+			agent_status_changed.emit(is_busy, "음성이 잘 안 들렸어. 다시 말해줘!")
+		"web_reset":
+			web_reset_requested.emit()
 		"user_transcript":
 			var ut: String = str(evt.get("text", "")).strip_edges()
 			if ut != "":
@@ -180,6 +191,24 @@ func request_user_turn(user_text: String, optional_crop_path: String = "", realt
 			}))
 		return
 
+	# 진행 중인 도구 루프 턴이 있으면 큐에 넣어 function_call/output 순서가 절대 섞이지 않게 직렬화
+	if not active_turns.is_empty():
+		var is_proactive: bool = user_text.begins_with("[감각 이벤트:")
+		if is_proactive:
+			for i in range(_pending_turn_queue.size() - 1, -1, -1):
+				if str(_pending_turn_queue[i].get("user_text", "")).begins_with("[감각 이벤트:"):
+					_pending_turn_queue.remove_at(i)
+		_pending_turn_queue.append({
+			"user_text": user_text,
+			"optional_crop_path": optional_crop_path,
+			"realtime_call_id": realtime_call_id
+		})
+		return
+
+	_start_serialized_turn(user_text, optional_crop_path, realtime_call_id)
+
+
+func _start_serialized_turn(user_text: String, optional_crop_path: String = "", realtime_call_id: String = "") -> void:
 	var content_parts: Array = [{"type": "input_text", "text": user_text}]
 	var data_url: String = _encode_crop_data_url(optional_crop_path)
 	if data_url != "":
@@ -204,6 +233,17 @@ func request_user_turn(user_text: String, optional_crop_path: String = "", realt
 		"user_text": user_text
 	}
 	_dispatch_turn_step(turn_id)
+
+
+func _drain_next_queued_turn() -> void:
+	if not active_turns.is_empty() or _pending_turn_queue.is_empty():
+		return
+	var nxt: Dictionary = _pending_turn_queue.pop_front()
+	_start_serialized_turn(
+		str(nxt.get("user_text", "")),
+		str(nxt.get("optional_crop_path", "")),
+		str(nxt.get("realtime_call_id", ""))
+	)
 
 
 func _dispatch_turn_step(turn_id: String) -> void:
@@ -232,7 +272,8 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 
 	if not bool(res.get("ok", false)):
 		active_turns.erase(turn_id)
-		is_busy = active_turns.size() > 0
+		_trim_history()
+		is_busy = active_turns.size() > 0 or not _pending_turn_queue.is_empty()
 		last_error = str(res.get("error", "unknown_error"))
 		agent_status_changed.emit(is_busy, "응답 오류 확인 필요")
 		if rt_call_id != "" and cam_plugin != null:
@@ -240,6 +281,7 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 				"ok": false,
 				"error": last_error
 			}))
+		_drain_next_queued_turn()
 		return
 
 	last_backend_used = str(res.get("backend", "session"))
@@ -247,24 +289,29 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 	var assistant_text: String = str(res.get("assistantText", "")).strip_edges()
 
 	var fn_calls: Array[Dictionary] = []
+	var msg_items: Array[Dictionary] = []
 	for item_v: Variant in out_items:
 		if not (item_v is Dictionary):
 			continue
 		var item: Dictionary = item_v as Dictionary
 		var itype: String = str(item.get("type", ""))
 		if itype == "function_call":
-			conversation_items.append({
-				"type": "function_call",
-				"call_id": str(item.get("call_id", "")),
-				"name": str(item.get("name", "")),
-				"arguments": str(item.get("arguments", "{}"))
-			})
 			fn_calls.append(item)
 		elif itype == "message":
-			conversation_items.append(item)
+			msg_items.append(item)
+
+	for m_it: Dictionary in msg_items:
+		conversation_items.append(m_it)
 
 	if fn_calls.size() > 0 and int(tstate["step"]) < MAX_TOOL_STEPS:
 		tstate["step"] = int(tstate["step"]) + 1
+		for fc: Dictionary in fn_calls:
+			conversation_items.append({
+				"type": "function_call",
+				"call_id": str(fc.get("call_id", "")),
+				"name": str(fc.get("name", "")),
+				"arguments": str(fc.get("arguments", "{}"))
+			})
 		for fc: Dictionary in fn_calls:
 			var call_id: String = str(fc.get("call_id", ""))
 			var fn_name: String = str(fc.get("name", ""))
@@ -296,7 +343,7 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 
 	# 최종 턴 완료
 	active_turns.erase(turn_id)
-	is_busy = active_turns.size() > 0
+	is_busy = active_turns.size() > 0 or not _pending_turn_queue.is_empty()
 	_trim_history()
 
 	if _last_vec_hits_in_turn.size() > 0 or _last_lex_hits_in_turn.size() > 0:
@@ -319,6 +366,7 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 		assistant_replied.emit(assistant_text, last_backend_used, false)
 
 	agent_status_changed.emit(is_busy, assistant_text if assistant_text != "" else "함께 보고 있어")
+	_drain_next_queued_turn()
 
 
 func _execute_companion_tool(fn_name: String, args: Dictionary) -> Dictionary:
@@ -420,9 +468,61 @@ func _encode_crop_data_url(crop_path: String) -> String:
 func _trim_history() -> void:
 	while conversation_items.size() > MAX_HISTORY_ITEMS:
 		conversation_items.pop_front()
-	# 첫 항목이 고아 function_call_output이 되지 않도록 정리
-	while conversation_items.size() > 0 and str(conversation_items[0].get("type", "")) == "function_call_output":
+	# 항상 깔끔한 user 메시지 경계에서 시작하도록 앞쪽 조각 정리
+	while conversation_items.size() > 0:
+		var head: Dictionary = conversation_items[0]
+		if str(head.get("type", "")) == "message" and str(head.get("role", "")) == "user":
+			break
 		conversation_items.pop_front()
+
+	# function_call <-> function_call_output 쌍 무결성 보장 (고아 항목으로 인한 400 에러 원천 차단)
+	var call_ids: Dictionary = {}
+	var out_ids: Dictionary = {}
+	for it: Dictionary in conversation_items:
+		var t: String = str(it.get("type", ""))
+		var cid: String = str(it.get("call_id", ""))
+		if cid == "":
+			continue
+		if t == "function_call":
+			call_ids[cid] = true
+		elif t == "function_call_output":
+			out_ids[cid] = true
+
+	var cleaned: Array[Dictionary] = []
+	for it: Dictionary in conversation_items:
+		var t: String = str(it.get("type", ""))
+		if t == "function_call" or t == "function_call_output":
+			var cid: String = str(it.get("call_id", ""))
+			if not (call_ids.has(cid) and out_ids.has(cid)):
+				continue
+		cleaned.append(it)
+	conversation_items = cleaned
+
+	# 최근 3장의 스냅샷 이미지만 base64를 유지하고 이전 이미지는 가볍게 축약해 전송 지연 방지
+	var img_seen: int = 0
+	for idx in range(conversation_items.size() - 1, -1, -1):
+		var item: Dictionary = conversation_items[idx]
+		if str(item.get("type", "")) != "message":
+			continue
+		var content_v: Variant = item.get("content", [])
+		if not (content_v is Array):
+			continue
+		var parts: Array = content_v as Array
+		var has_img: bool = false
+		for p_v: Variant in parts:
+			if p_v is Dictionary and str((p_v as Dictionary).get("type", "")) == "input_image":
+				has_img = true
+				break
+		if has_img:
+			img_seen += 1
+			if img_seen > 3:
+				var compact_parts: Array = []
+				for p_v: Variant in parts:
+					if p_v is Dictionary and str((p_v as Dictionary).get("type", "")) != "input_image":
+						compact_parts.append(p_v)
+				if compact_parts.is_empty():
+					compact_parts.append({"type": "input_text", "text": "[이전 카메라 스냅샷 기록]"})
+				item["content"] = compact_parts
 
 
 func _build_companion_tools_schema(include_web_search: bool) -> Array:
