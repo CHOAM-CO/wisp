@@ -3,6 +3,7 @@
 **내 시선과 손길을 느끼고 기억하는 Meta Quest 3 혼합현실(MR) 연기 정령 일상 컴패니언**
 
 - **시연 영상 (Demo Video)**: [Google Drive 시연 영상 보기](https://drive.google.com/file/d/12QiCD0QawXT0TcQRE8VTY68geve4ewGp/view?usp=sharing) (`https://drive.google.com/file/d/12QiCD0QawXT0TcQRE8VTY68geve4ewGp/view?usp=sharing`)
+- **발표 자료 (Pitch Deck)**: [Wisp_Spatial_AI_Companion.pdf](docs/Wisp_Spatial_AI_Companion.pdf)
 - **GitHub 저장소**: `https://github.com/CHOAM-CO/wisp`
 
 Wisp는 맥북 등 별도 중계 서버 없이 **Meta Quest 3 헤드셋 단독(Standalone)**으로 동작하며, Horizon OS **Seamless Multitasking(2D 앱 창 동시 공존)** 환경에서 사용자의 일상 작업 창 옆에 떠서 함께 보고·느끼고·기억하고·대화하는 공간 상주형 AI 컴패니언입니다.
