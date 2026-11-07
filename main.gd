@@ -11,6 +11,7 @@ var xr_interface: OpenXRInterface
 var has_input_focus: bool = true
 var desktop_mode: bool = false
 var cam_plugin: Object = null
+const UI_TEXT_SS: int = 3
 var kr_font: Font = null
 
 var memory_engine = null
@@ -170,9 +171,10 @@ func _make_label(font_sz: int, px_size: float = 0.00105, prio: int = 3) -> Label
 	var lbl := Label3D.new()
 	if kr_font != null:
 		lbl.font = kr_font
-	lbl.font_size = font_sz
-	lbl.pixel_size = px_size
-	lbl.outline_size = 5
+	# Rasterize glyphs at 3x and shrink pixel_size by 3x: same physical size, crisp text in the headset.
+	lbl.font_size = font_sz * UI_TEXT_SS
+	lbl.pixel_size = px_size / float(UI_TEXT_SS)
+	lbl.outline_size = 5 * UI_TEXT_SS
 	lbl.render_priority = prio
 	return lbl
 
@@ -726,7 +728,7 @@ func _build_dialogue_card() -> void:
 	dialogue_body_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	dialogue_body_label.vertical_alignment = VERTICAL_ALIGNMENT_TOP
 	dialogue_body_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	dialogue_body_label.width = 410.0
+	dialogue_body_label.width = 410.0 * UI_TEXT_SS
 	dialogue_body_label.position = Vector3(-0.19, 0.044, 0.012)
 	dialogue_card_root.add_child(dialogue_body_label)
 
@@ -777,7 +779,7 @@ func _build_recommendation_card() -> void:
 	rec_talk_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	rec_talk_label.vertical_alignment = VERTICAL_ALIGNMENT_TOP
 	rec_talk_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	rec_talk_label.width = 365.0
+	rec_talk_label.width = 365.0 * UI_TEXT_SS
 	rec_talk_label.position = Vector3(-0.136, 0.118, 0.012)
 	rec_card_root.add_child(rec_talk_label)
 
@@ -789,7 +791,7 @@ func _build_recommendation_card() -> void:
 	rec_prod1_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	rec_prod1_label.vertical_alignment = VERTICAL_ALIGNMENT_TOP
 	rec_prod1_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	rec_prod1_label.width = 470.0
+	rec_prod1_label.width = 470.0 * UI_TEXT_SS
 	rec_prod1_label.position = Vector3(-0.215, 0.032, 0.012)
 	rec_card_root.add_child(rec_prod1_label)
 
@@ -801,7 +803,7 @@ func _build_recommendation_card() -> void:
 	rec_prod2_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	rec_prod2_label.vertical_alignment = VERTICAL_ALIGNMENT_TOP
 	rec_prod2_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	rec_prod2_label.width = 470.0
+	rec_prod2_label.width = 470.0 * UI_TEXT_SS
 	rec_prod2_label.position = Vector3(-0.215, -0.046, 0.012)
 	rec_card_root.add_child(rec_prod2_label)
 
@@ -906,7 +908,7 @@ func _build_debug_overlays() -> void:
 	xray_text_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	xray_text_label.vertical_alignment = VERTICAL_ALIGNMENT_TOP
 	xray_text_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	xray_text_label.width = 615.0
+	xray_text_label.width = 615.0 * UI_TEXT_SS
 	xray_text_label.position = Vector3(-0.242, 0.165, 0.012)
 	debug_memory_panel.add_child(xray_text_label)
 

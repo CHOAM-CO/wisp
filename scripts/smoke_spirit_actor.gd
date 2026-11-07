@@ -210,9 +210,9 @@ func setup(kr_font: Font, initial_home: Vector3) -> void:
 	status_label = Label3D.new()
 	if kr_font != null:
 		status_label.font = kr_font
-	status_label.font_size = 21
-	status_label.pixel_size = 0.00118
-	status_label.outline_size = 5
+	status_label.font_size = 21 * 3
+	status_label.pixel_size = 0.00118 / 3.0
+	status_label.outline_size = 5 * 3
 	status_label.render_priority = 4
 	status_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	status_label.position = Vector3(0.0, 0.24, 0.0)
