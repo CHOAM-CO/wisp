@@ -8,6 +8,9 @@ import android.media.AudioTrack
 import android.net.Uri
 import android.util.Base64
 import android.util.Log
+import okhttp3.Cookie
+import okhttp3.CookieJar
+import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -32,10 +35,12 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -63,6 +68,10 @@ class WispStandaloneRuntime(
         private const val AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
         private const val TOKEN_URL = "https://auth.openai.com/oauth/token"
         private const val REDIRECT_URI = "http://localhost:1455/auth/callback"
+        private const val DEVICE_USERCODE_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode"
+        private const val DEVICE_TOKEN_URL = "https://auth.openai.com/api/accounts/deviceauth/token"
+        private const val DEVICE_VERIFY_URL = "https://auth.openai.com/codex/device"
+        private const val DEVICE_CALLBACK_URI = "https://auth.openai.com/deviceauth/callback"
         private const val CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
         private const val CODEX_CLIENT_VERSION = "0.153.3"
         private const val OPENAI_API_BASE = "https://api.openai.com/v1"
@@ -87,6 +96,11 @@ class WispStandaloneRuntime(
 
     @Volatile private var pkceVerifier: String = ""
     @Volatile private var pkceState: String = ""
+    private val deviceAuthEpoch = AtomicInteger(0)
+    @Volatile private var deviceAuthState: String = "idle"
+    @Volatile private var deviceUserCode: String = ""
+    @Volatile private var deviceVerificationUrl: String = DEVICE_VERIFY_URL
+    @Volatile private var deviceAuthError: String = ""
     @Volatile private var discoveredCatalogModels: List<String> = emptyList()
     @Volatile private var discoveredReasoningEffort: Map<String, String> = emptyMap()
     @Volatile private var externalTtsSpeakingUntilMs: Long = 0L
@@ -96,7 +110,23 @@ class WispStandaloneRuntime(
     private val pttLock = Any()
     private val pttPcmStream = ByteArrayOutputStream()
 
+    private val authCookieStore = ConcurrentHashMap<String, Cookie>()
+
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .cookieJar(object : CookieJar {
+            override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+                if (url.host.endsWith("openai.com")) {
+                    for (c in cookies) {
+                        authCookieStore["${c.domain}:${c.name}"] = c
+                    }
+                }
+            }
+            override fun loadForRequest(url: HttpUrl): List<Cookie> {
+                if (!url.host.endsWith("openai.com")) return emptyList()
+                val now = System.currentTimeMillis()
+                return authCookieStore.values.filter { it.expiresAt > now && it.matches(url) }
+            }
+        })
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(95, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -237,6 +267,10 @@ class WispStandaloneRuntime(
             put("pttRecording", pttRecording.get())
             put("lastUserTranscript", lastUserTranscript)
             put("lastAssistantTranscript", lastAssistantTranscript)
+            put("deviceAuthState", deviceAuthState)
+            put("deviceUserCode", deviceUserCode)
+            put("deviceVerificationUrl", deviceVerificationUrl)
+            put("deviceAuthError", deviceAuthError)
         }.toString()
     }
 
@@ -1501,6 +1535,17 @@ class WispStandaloneRuntime(
                             "&originator=codex_cli_rs"
                         writeRedirect(sock, authUrl)
                     }
+                    (method == "GET" || method == "POST") && path == "/auth/device" -> {
+                        val ok = startDeviceCodeFlow()
+                        writeRedirect(sock, if (ok) "/setup?msg=device_started" else "/setup?msg=device_err")
+                    }
+                    method == "POST" && path == "/auth/device/cancel" -> {
+                        deviceAuthEpoch.incrementAndGet()
+                        deviceAuthState = "idle"
+                        deviceUserCode = ""
+                        deviceAuthError = ""
+                        writeRedirect(sock, "/setup")
+                    }
                     method == "GET" && path == "/auth/callback" -> {
                         val params = parseFormEncoded(queryStr)
                         val code = params["code"] ?: ""
@@ -1509,8 +1554,11 @@ class WispStandaloneRuntime(
                             writeRedirect(sock, "/setup?msg=oauth_state_err")
                             return
                         }
-                        val ok = exchangePkceCode(code, pkceVerifier)
+                        val ok = exchangePkceCode(code, pkceVerifier, REDIRECT_URI)
                         if (ok) {
+                            deviceAuthEpoch.incrementAndGet()
+                            deviceAuthState = "completed"
+                            deviceUserCode = ""
                             workerPool.execute { refreshCatalogModelSafe() }
                             pushRuntimeEvent("auth_updated") { put("source", "oauth_pkce") }
                             writeRedirect(sock, "/setup?msg=oauth_ok")
@@ -1563,6 +1611,10 @@ class WispStandaloneRuntime(
                         writeRedirect(sock, "/setup?msg=reset_ok")
                     }
                     method == "POST" && path == "/setup/logout" -> {
+                        deviceAuthEpoch.incrementAndGet()
+                        deviceAuthState = "idle"
+                        deviceUserCode = ""
+                        deviceAuthError = ""
                         synchronized(authLock) { auth = StoredAuth() }
                         saveAuthToDisk()
                         disconnectRealtime()
@@ -1584,16 +1636,134 @@ class WispStandaloneRuntime(
         }
     }
 
-    private fun exchangePkceCode(code: String, verifier: String): Boolean {
+    private fun startDeviceCodeFlow(): Boolean {
+        return try {
+            val reqJson = JSONObject().put("client_id", CLIENT_ID).toString()
+            val req = Request.Builder()
+                .url(DEVICE_USERCODE_URL)
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "codex_cli_rs/$CODEX_CLIENT_VERSION")
+                .header("originator", "codex_cli_rs")
+                .post(reqJson.toRequestBody("application/json".toMediaType()))
+                .build()
+
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    deviceAuthState = "error"
+                    deviceUserCode = ""
+                    deviceAuthError = if (resp.code == 404) "not_enabled_404" else "http_${resp.code}"
+                    Log.w(TAG, "Device code usercode HTTP ${resp.code}: ${resp.body?.string()?.take(240)}")
+                    return false
+                }
+                val data = JSONObject(resp.body?.string() ?: return false)
+                val devAuthId = data.optString("device_auth_id", "").trim()
+                val uCode = data.optString("user_code", data.optString("usercode", "")).trim()
+                val intervalSec = data.optString("interval", "5").trim().toLongOrNull()?.coerceIn(3L, 30L) ?: 5L
+                if (devAuthId.isBlank() || uCode.isBlank()) {
+                    deviceAuthState = "error"
+                    deviceAuthError = "empty_user_code"
+                    return false
+                }
+
+                val myEpoch = deviceAuthEpoch.incrementAndGet()
+                deviceAuthState = "waiting"
+                deviceUserCode = uCode
+                deviceVerificationUrl = DEVICE_VERIFY_URL
+                deviceAuthError = ""
+                pushRuntimeEvent("device_code_ready") {
+                    put("code", uCode)
+                    put("url", DEVICE_VERIFY_URL)
+                }
+
+                workerPool.execute {
+                    val startMs = System.currentTimeMillis()
+                    val maxWaitMs = 15L * 60L * 1000L
+                    while (serverRunning.get() && deviceAuthEpoch.get() == myEpoch && (System.currentTimeMillis() - startMs) < maxWaitMs) {
+                        try {
+                            Thread.sleep(intervalSec * 1000L)
+                        } catch (_: InterruptedException) {
+                            break
+                        }
+                        if (!serverRunning.get() || deviceAuthEpoch.get() != myEpoch) break
+
+                        val pollBody = JSONObject()
+                            .put("device_auth_id", devAuthId)
+                            .put("user_code", uCode)
+                            .toString()
+                        val pollReq = Request.Builder()
+                            .url(DEVICE_TOKEN_URL)
+                            .header("Content-Type", "application/json")
+                            .header("User-Agent", "codex_cli_rs/$CODEX_CLIENT_VERSION")
+                            .header("originator", "codex_cli_rs")
+                            .post(pollBody.toRequestBody("application/json".toMediaType()))
+                            .build()
+
+                        try {
+                            httpClient.newCall(pollReq).execute().use { pResp ->
+                                val code = pResp.code
+                                if (code == 403 || code == 404) {
+                                    // Normal pending state until user approves on PC/phone
+                                } else if (pResp.isSuccessful) {
+                                    val pData = JSONObject(pResp.body?.string() ?: "{}")
+                                    val authCode = pData.optString("authorization_code", "").trim()
+                                    val codeVerifier = pData.optString("code_verifier", "").trim()
+                                    if (authCode.isNotBlank() && codeVerifier.isNotBlank()) {
+                                        val exchanged = exchangePkceCode(authCode, codeVerifier, DEVICE_CALLBACK_URI)
+                                        if (exchanged && deviceAuthEpoch.get() == myEpoch) {
+                                            deviceAuthState = "completed"
+                                            deviceUserCode = ""
+                                            deviceAuthError = ""
+                                            workerPool.execute { refreshCatalogModelSafe() }
+                                            pushRuntimeEvent("auth_updated") { put("source", "device_code") }
+                                            Log.i(TAG, "Device code OAuth login succeeded!")
+                                            return@execute
+                                        }
+                                    }
+                                    if (deviceAuthEpoch.get() == myEpoch) {
+                                        deviceAuthState = "error"
+                                        deviceAuthError = "token_exchange_failed"
+                                    }
+                                    return@execute
+                                } else {
+                                    Log.w(TAG, "Device code poll unexpected HTTP $code")
+                                    if (deviceAuthEpoch.get() == myEpoch) {
+                                        deviceAuthState = "error"
+                                        deviceAuthError = "poll_http_$code"
+                                    }
+                                    return@execute
+                                }
+                            }
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "Device code poll transient error: ${t.message}")
+                        }
+                    }
+                    if (deviceAuthEpoch.get() == myEpoch && deviceAuthState == "waiting") {
+                        deviceAuthState = "error"
+                        deviceAuthError = "timeout"
+                    }
+                }
+                true
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "startDeviceCodeFlow failed", t)
+            deviceAuthState = "error"
+            deviceAuthError = t.javaClass.simpleName
+            false
+        }
+    }
+
+    private fun exchangePkceCode(code: String, verifier: String, redirectUri: String = REDIRECT_URI): Boolean {
         return try {
             val form = "grant_type=authorization_code" +
                 "&client_id=${URLEncoder.encode(CLIENT_ID, "UTF-8")}" +
                 "&code=${URLEncoder.encode(code, "UTF-8")}" +
-                "&redirect_uri=${URLEncoder.encode(REDIRECT_URI, "UTF-8")}" +
+                "&redirect_uri=${URLEncoder.encode(redirectUri, "UTF-8")}" +
                 "&code_verifier=${URLEncoder.encode(verifier, "UTF-8")}"
             val req = Request.Builder()
                 .url(TOKEN_URL)
                 .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("User-Agent", "codex_cli_rs/$CODEX_CLIENT_VERSION")
+                .header("originator", "codex_cli_rs")
                 .post(form.toRequestBody("application/x-www-form-urlencoded".toMediaType()))
                 .build()
             httpClient.newCall(req).execute().use { resp ->
@@ -1683,12 +1853,40 @@ class WispStandaloneRuntime(
         }
 
         val banner = when (msgCode) {
-            "oauth_ok" -> "<div class='ok'>ChatGPT 구독 OAuth 로그인이 완료됐어! 이제 헤드셋 단독으로 위습 세션이 동작해.</div>"
+            "oauth_ok" -> "<div class='ok'>ChatGPT 구독 로그인이 완료됐어! 이제 헤드셋 단독으로 위습 세션이 동작해.</div>"
+            "device_started" -> "<div class='ok'>일회용 기기 코드가 발급됐어! 맥북·PC 브라우저에서 보안키로 로그인한 뒤 아래 코드를 입력해 줘.</div>"
+            "device_err" -> "<div class='warn'>기기 코드 발급에 실패했어 (${deviceAuthError}). ChatGPT 보안 설정에서 Codex 기기 코드 로그인 허용이 켜져 있는지 점검해 줘.</div>"
             "saved" -> "<div class='ok'>설정이 저장됐어! 옆에 떠 있는 위습과 바로 대화해 봐.</div>"
             "sent" -> "<div class='ok'>위습에게 메시지를 보냈어!</div>"
             "reset_ok" -> "<div class='ok'>위습의 시선 기억과 대화 세션을 초기화했어!</div>"
             "cleared" -> "<div class='warn'>저장된 인증 정보를 초기화했어.</div>"
-            "oauth_exchange_err", "oauth_state_err" -> "<div class='warn'>OAuth 토큰 교환에 실패했어. 다시 로그인 버튼을 누르거나 auth.json을 붙여넣어 줘.</div>"
+            "oauth_exchange_err", "oauth_state_err" -> "<div class='warn'>OAuth 토큰 교환에 실패했어. 다시 시도하거나 기기 코드 로그인을 사용해 줘.</div>"
+            else -> ""
+        }
+
+        val deviceBoxHtml = when {
+            deviceAuthState == "waiting" && deviceUserCode.isNotBlank() -> """
+                <div style="margin-top:14px;padding:16px;background:#091829;border:1.5px solid #38bdf8;border-radius:14px">
+                  <div style="font-size:13px;color:#93c5fd;margin-bottom:6px">1단계 · 맥북 또는 PC 브라우저(보안키 USB 사용 가능)에서 아래 주소 열기</div>
+                  <div style="font-size:17px;font-weight:700;margin-bottom:12px">
+                    <a href="$deviceVerificationUrl" target="_blank" style="color:#7ee8fa;text-decoration:underline">$deviceVerificationUrl</a>
+                  </div>
+                  <div style="font-size:13px;color:#93c5fd;margin-bottom:6px">2단계 · 아래 일회용 코드 입력 (입력 완료 시 이 화면이 자동으로 연결됨!)</div>
+                  <div style="font-family:monospace;font-size:30px;font-weight:800;letter-spacing:4px;color:#a7f3d0;background:#06101c;padding:12px 16px;border-radius:10px;display:inline-block;margin-bottom:10px">$deviceUserCode</div>
+                  <div id="devPollMsg" style="font-size:13px;color:#cbd5e1">⏳ 승인 대기 중... (유효시간 15분 · 2초마다 자동 감지 중)</div>
+                  <form method="POST" action="/auth/device/cancel" style="margin-top:10px">
+                    <button class="btn-sec" type="submit">코드 취소</button>
+                  </form>
+                </div>
+            """.trimIndent()
+            deviceAuthState == "error" && deviceAuthError == "not_enabled_404" -> """
+                <div class="warn" style="margin-top:12px">
+                  ChatGPT 웹 설정(Settings → Security)에서 <b>Enable device code sign-in for Codex</b> 옵션을 켠 뒤 다시 눌러 줘!
+                </div>
+            """.trimIndent()
+            deviceAuthState == "error" && deviceAuthError.isNotBlank() -> """
+                <div class="warn" style="margin-top:12px">기기 코드 인증 오류: $deviceAuthError (다시 발급 버튼을 눌러 새로 시도해 줘)</div>
+            """.trimIndent()
             else -> ""
         }
 
@@ -1707,8 +1905,8 @@ class WispStandaloneRuntime(
                 h2{font-size:16px;margin:0 0 10px;color:#b8d8ff}
                 .sub{font-size:13px;color:#9bb0ce;margin-bottom:14px}
                 .stat{font-size:14px;margin:6px 0;padding:8px 12px;background:#0d1424;border-radius:10px}
-                .btn{display:inline-block;background:linear-gradient(135deg,#2dd4bf,#38bdf8);color:#06121e;font-weight:700;padding:12px 18px;border-radius:12px;text-decoration:none;border:none;font-size:15px;cursor:pointer}
-                .btn-sec{background:#23324d;color:#d9e8ff;font-weight:600;padding:10px 15px;border-radius:10px;border:1px solid #354b73;cursor:pointer;margin-right:8px}
+                .btn{display:inline-block;background:linear-gradient(135deg,#2dd4bf,#38bdf8);color:#06121e;font-weight:700;padding:12px 18px;border-radius:12px;text-decoration:none;border:none;font-size:15px;cursor:pointer;margin-right:8px;margin-bottom:8px}
+                .btn-sec{display:inline-block;background:#23324d;color:#d9e8ff;font-weight:600;padding:11px 15px;border-radius:10px;border:1px solid #354b73;text-decoration:none;cursor:pointer;margin-right:8px;margin-bottom:8px;font-size:14px}
                 input[type=text],input[type=password],select,textarea{width:100%;box-sizing:border-box;background:#0b1220;color:#eaf2ff;border:1px solid #2b3f63;border-radius:10px;padding:10px 12px;font-size:14px;margin-top:6px;margin-bottom:12px}
                 textarea{min-height:84px;font-family:monospace;font-size:12px}
                 .ok{background:#11382f;border:1px solid #2dd4bf;color:#a7f3d0;padding:10px 14px;border-radius:12px;margin-bottom:14px;font-size:14px}
@@ -1728,9 +1926,13 @@ class WispStandaloneRuntime(
                 </div>
 
                 <div class="card">
-                  <h2>1. ChatGPT 구독 계정 로그인 (백엔드 지속 컴패니언 세션)</h2>
-                  <div class="sub">아래 버튼을 누르면 이 브라우저에서 바로 OpenAI OAuth 로그인이 진행되고 localhost:1455로 자동 복귀해.</div>
-                  <a class="btn" href="/auth/start">ChatGPT 구독 OAuth 로그인 시작</a>
+                  <h2>1. ChatGPT 구독 계정 로그인 (물리 보안키 · 단독 세션 지원)</h2>
+                  <div class="sub">보안키(YubiKey 등)를 쓰는 계정은 <b>기기 코드로 로그인</b>을 누른 뒤 맥북·PC에서 코드만 입력하면 퀘스트에 바로 저장돼!</div>
+                  <div>
+                    <a class="btn" href="/auth/device">🔑 기기 코드로 로그인 (보안키·외부 기기 인증)</a>
+                    <a class="btn-sec" href="/auth/start">🌐 이 브라우저에서 바로 OAuth 로그인</a>
+                  </div>
+                  $deviceBoxHtml
                 </div>
 
                 <div class="card">
@@ -1774,6 +1976,21 @@ class WispStandaloneRuntime(
               </div>
               <script>
                 (function(){
+                  var waiting = ${if (deviceAuthState == "waiting") "true" else "false"};
+                  if (waiting) {
+                    setInterval(function(){
+                      fetch('/api/status', {cache:'no-store'})
+                        .then(function(r){ return r.json(); })
+                        .then(function(st){
+                          if (st.oauthReady && st.deviceAuthState === 'completed') {
+                            window.location.href = '/setup?msg=oauth_ok';
+                          } else if (st.deviceAuthState === 'error') {
+                            window.location.href = '/setup?msg=device_err';
+                          }
+                        })
+                        .catch(function(){});
+                    }, 2000);
+                  }
                   var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
                   var btn = document.getElementById('micBtn');
                   var inp = document.getElementById('promptInput');

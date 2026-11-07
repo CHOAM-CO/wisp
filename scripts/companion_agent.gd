@@ -137,8 +137,12 @@ func _handle_runtime_event(evt: Dictionary) -> void:
 			if at != "":
 				_append_context_only_message("assistant", at)
 				agent_status_changed.emit(false, at)
+		"device_code_ready":
+			var dc: String = str(evt.get("code", "")).strip_edges()
+			if dc != "":
+				agent_status_changed.emit(false, "PC에서 auth.openai.com/codex/device 열고 코드 [" + dc + "] 입력해줘!")
 		"auth_updated":
-			agent_status_changed.emit(false, "세션 인증 갱신됨")
+			agent_status_changed.emit(false, "구독 로그인 완료! 이제 편하게 말 걸어줘!")
 
 
 func _append_context_only_message(role: String, text: String) -> void:
