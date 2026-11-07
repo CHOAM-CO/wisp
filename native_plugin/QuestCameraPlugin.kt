@@ -1537,37 +1537,10 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
 
         val cropBmp = Bitmap.createBitmap(bmp, x0, y0, x1 - x0, y1 - y0)
 
-        // Prefer full-resolution passthrough camera JPEG so brand logos, text, and fine textures are crisp!
-        var hiResBytes: ByteArray? = null
-        val fullJpeg = latestJpeg.get()
-        if (fullJpeg.size > 128) {
-            runCatching {
-                val fullBmp = BitmapFactory.decodeByteArray(fullJpeg, 0, fullJpeg.size)
-                if (fullBmp != null) {
-                    val fw = fullBmp.width
-                    val fh = fullBmp.height
-                    val fx0 = ((tr.xmin - padX) * fw).toInt().coerceIn(0, fw - 2)
-                    val fy0 = ((tr.ymin - padY) * fh).toInt().coerceIn(0, fh - 2)
-                    val fx1 = ((tr.xmax + padX) * fw).toInt().coerceIn(fx0 + 2, fw)
-                    val fy1 = ((tr.ymax + padY) * fh).toInt().coerceIn(fy0 + 2, fh)
-                    var hiCrop = Bitmap.createBitmap(fullBmp, fx0, fy0, fx1 - fx0, fy1 - fy0)
-                    if (hiCrop.width > 768) {
-                        val scaledH = (hiCrop.height * 768 / hiCrop.width).coerceAtLeast(32)
-                        hiCrop = Bitmap.createScaledBitmap(hiCrop, 768, scaledH, true)
-                    }
-                    val hiOut = ByteArrayOutputStream()
-                    hiCrop.compress(Bitmap.CompressFormat.JPEG, 88, hiOut)
-                    hiResBytes = hiOut.toByteArray()
-                }
-            }
-        }
-        if (hiResBytes != null && hiResBytes!!.size > 64) {
-            tr.bestCropBytes = hiResBytes
-        } else {
-            val out = ByteArrayOutputStream()
-            cropBmp.compress(Bitmap.CompressFormat.JPEG, 88, out)
-            tr.bestCropBytes = out.toByteArray()
-        }
+        // Hi-res full-frame decode per crop update starved the CPU (10fps, broken tracking); keep the cheap crop path.
+        val out = ByteArrayOutputStream()
+        cropBmp.compress(Bitmap.CompressFormat.JPEG, 88, out)
+        tr.bestCropBytes = out.toByteArray()
 
         // Extract genuine pixel color tone + 24-bin RGB/spatial visual signature for multimodal embedding
         var sumR = 0f; var sumG = 0f; var sumB = 0f; var cnt = 0
