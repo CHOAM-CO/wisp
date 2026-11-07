@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
@@ -165,11 +166,32 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
 
     @Volatile private var xrSessionReady: Boolean = false
 
+    private val wispRuntime = WispStandaloneRuntime(
+        contextProvider = { context },
+        activityStarter = { intent ->
+            val act = activity
+            if (act != null) {
+                act.startActivity(intent)
+                true
+            } else {
+                val ctx = context
+                if (ctx != null) {
+                    ctx.startActivity(intent)
+                    true
+                } else {
+                    false
+                }
+            }
+        },
+        latestFrameProvider = { latestJpeg.get() }
+    )
+
     override fun getPluginName(): String = "QuestCameraPlugin"
 
     override fun onGodotMainLoopStarted() {
         super.onGodotMainLoopStarted()
         startBackgroundThreads()
+        wispRuntime.start()
         initVisionModelsAsync()
         initTtsSafe()
         probeSpeakerAndPlayBootChime()
@@ -177,18 +199,29 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     }
 
     override fun onMainPause() {
-        xrSessionReady = false
-        stopMicLoop()
-        closeCamera()
+        // Horizon OS Seamless Multitasking: focusing a 2D window alongside the MR app
+        // triggers Activity.onPause() while OpenXR stays in XR_SESSION_STATE_VISIBLE.
+        // Keep camera, vision, mic, and Realtime voice alive while xrSessionReady is true!
+        if (!xrSessionReady) {
+            stopMicLoop()
+            closeCamera()
+        } else {
+            Log.i(TAG, "onMainPause with active XR session: keeping camera & voice alive for Seamless Multitasking")
+        }
         super.onMainPause()
     }
 
     override fun onMainResume() {
         super.onMainResume()
         requestPermsOnlyIfMissing()
+        if (xrSessionReady && cameraDevice == null) {
+            ensurePermissionsAndStartAsync()
+        }
     }
 
     override fun onMainDestroy() {
+        xrSessionReady = false
+        wispRuntime.stop()
         stopMicLoop()
         closeCamera()
         try {
@@ -222,6 +255,7 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     @UsedByGodot
     fun setXrActive(active: Boolean): String {
         xrSessionReady = active
+        wispRuntime.setVoiceSessionActive(active)
         if (active) {
             ensurePermissionsAndStartAsync()
         } else {
@@ -239,6 +273,96 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     }
 
     @UsedByGodot
+    fun openSetupBrowser(): String {
+        return wispRuntime.openUrlIn2dBrowser(WispStandaloneRuntime.SETUP_URL)
+    }
+
+    @UsedByGodot
+    fun open2dBrowserUrl(url: String): String {
+        return wispRuntime.openUrlIn2dBrowser(url)
+    }
+
+    @UsedByGodot
+    fun getAuthAndVoiceStateJson(): String {
+        return wispRuntime.getStateJson()
+    }
+
+    @UsedByGodot
+    fun popRuntimeEventsJson(): String {
+        return wispRuntime.popRuntimeEventsJson()
+    }
+
+    @UsedByGodot
+    fun runCompanionTurnAsync(turnId: String, payloadJson: String): String {
+        return wispRuntime.runCompanionTurnAsync(turnId, payloadJson)
+    }
+
+    @UsedByGodot
+    fun popCompanionTurnResultsJson(): String {
+        return wispRuntime.popTurnResultsJson()
+    }
+
+    @UsedByGodot
+    fun submitRealtimeToolOutput(callId: String, outputJson: String): String {
+        return wispRuntime.submitRealtimeToolOutput(callId, outputJson)
+    }
+
+    @UsedByGodot
+    fun injectRealtimeSensoryEvent(contextText: String, triggerVoiceResponse: Boolean): String {
+        return wispRuntime.injectRealtimeSensoryEvent(contextText, triggerVoiceResponse)
+    }
+
+    @UsedByGodot
+    fun runVisionAnnotateAndEmbedAsync(memId: String, cropPath: String, fallbackHint: String): String {
+        return wispRuntime.runVisionAnnotateAndEmbedAsync(memId, cropPath, fallbackHint)
+    }
+
+    @UsedByGodot
+    fun popVisionUpgradesJson(): String {
+        return wispRuntime.popVisionUpgradesJson()
+    }
+
+    @UsedByGodot
+    fun fetchQueryEmbeddingSync(queryText: String): String {
+        return wispRuntime.fetchQueryEmbeddingSync(queryText)
+    }
+
+    @UsedByGodot
+    fun captureLiveGazeSnapshotJson(): String {
+        val out = JSONObject()
+        try {
+            val extDir = context?.getExternalFilesDir(null)
+            val frameBytes = latestJpeg.get()
+            if (extDir != null && frameBytes.size > 64) {
+                val fullBmp = BitmapFactory.decodeByteArray(frameBytes, 0, frameBytes.size)
+                if (fullBmp != null) {
+                    // Crop Center-Gaze ROI (middle 56% of passthrough camera)
+                    val w = fullBmp.width
+                    val h = fullBmp.height
+                    val x0 = (w * 0.22f).toInt().coerceIn(0, w - 2)
+                    val y0 = (h * 0.22f).toInt().coerceIn(0, h - 2)
+                    val cw = (w * 0.56f).toInt().coerceIn(2, w - x0)
+                    val ch = (h * 0.56f).toInt().coerceIn(2, h - y0)
+                    val cropBmp = Bitmap.createBitmap(fullBmp, x0, y0, cw, ch)
+                    val jpgOut = ByteArrayOutputStream()
+                    cropBmp.compress(Bitmap.CompressFormat.JPEG, 85, jpgOut)
+                    val cropBytes = jpgOut.toByteArray()
+                    val cropsDir = File(extDir, "crops").apply { mkdirs() }
+                    val f = File(cropsDir, "gaze_live_${System.currentTimeMillis()}.jpg")
+                    f.writeBytes(cropBytes)
+                    out.put("ok", true)
+                    out.put("cropPath", f.absolutePath)
+                    out.put("cropB64", android.util.Base64.encodeToString(cropBytes, android.util.Base64.NO_WRAP))
+                }
+            }
+        } catch (t: Throwable) {
+            out.put("ok", false)
+            out.put("error", t.message ?: "snapshot_err")
+        }
+        return out.toString()
+    }
+
+    @UsedByGodot
     fun playTestChime(): String {
         playMoodChimeAsync("recommend")
         return speakerStatus
@@ -247,12 +371,17 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     @UsedByGodot
     fun speakOrChime(text: String, mood: String): String {
         playMoodChimeAsync(mood)
-        if (text.isNotBlank() && ttsReadyKo) {
-            try {
-                ttsEngine?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "utt_${System.currentTimeMillis()}")
-                return "tts_spoken"
-            } catch (t: Throwable) {
-                Log.w(TAG, "TTS speak fallback: ${t.message}")
+        if (text.isNotBlank()) {
+            if (wispRuntime.speakLineViaRealtime(text)) {
+                return "realtime_spoken"
+            }
+            if (ttsReadyKo) {
+                try {
+                    ttsEngine?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "utt_${System.currentTimeMillis()}")
+                    return "tts_spoken"
+                } catch (t: Throwable) {
+                    Log.w(TAG, "TTS speak fallback: ${t.message}")
+                }
             }
         }
         return "chime_played"
@@ -602,6 +731,7 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
                         if (rms > 0.020) {
                             voiceSpeakingRecentMs = System.currentTimeMillis()
                         }
+                        wispRuntime.onMicPcm16Chunk(shortBuf, n)
                         if (localPeak > micPeakAbs) micPeakAbs = localPeak
                         micReadChunks += 1
                         if (micReadChunks == 1 || micReadChunks % 25 == 0) {

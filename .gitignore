@@ -5,6 +5,8 @@
 # Android unpacked build template & outputs
 android/build/
 android/.gradle/
+android/.build_version
+android/plugins/
 builds/*.apk
 builds/*.aab
 builds/*.idsig

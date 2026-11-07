@@ -8,9 +8,13 @@ export PATH="/opt/homebrew/opt/openjdk@21/bin:/opt/homebrew/opt/gradle@8/bin:$AN
 cd "$(dirname "$0")"
 mkdir -p builds
 
+if [[ -d "android/build/src/main/java/com/godot/game" ]]; then
+  cp native_plugin/*.kt android/build/src/main/java/com/godot/game/
+fi
+
 if [[ "${1:-}" != "--skip-export" ]]; then
-  echo "[1/4] Exporting Quest APK via Godot 4.7.2..."
-  /Applications/Godot-4.7.2.app/Contents/MacOS/Godot --headless --export-debug "Meta Quest" builds/QuestCompanionStarter.apk
+  echo "[1/4] Exporting standalone Wisp Quest APK via Godot 4.7.2..."
+  /Applications/Godot-4.7.2.app/Contents/MacOS/Godot --headless --xr-mode off --export-debug "Meta Quest" builds/QuestCompanionStarter.apk
 else
   echo "[1/4] Skipping Godot export (--skip-export)."
 fi
@@ -24,8 +28,7 @@ adb shell pm grant com.cayde.questcompanion android.permission.CAMERA || true
 adb shell pm grant com.cayde.questcompanion horizonos.permission.HEADSET_CAMERA || true
 adb shell pm grant com.cayde.questcompanion android.permission.RECORD_AUDIO || true
 adb shell pm grant com.cayde.questcompanion com.oculus.permission.HAND_TRACKING || true
-adb reverse tcp:8765 tcp:8765 || true
 
-echo "[4/4] Launching MR Gaze-Centered Companion on Quest 3..."
+echo "[4/4] Launching Wisp Standalone MR Companion on Quest 3..."
 adb shell am force-stop com.cayde.questcompanion || true
 adb shell monkey -p com.cayde.questcompanion -c android.intent.category.LAUNCHER 1
