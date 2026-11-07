@@ -10,8 +10,8 @@ signal auth_required_prompt(reason: String)
 signal web_reset_requested()
 signal voice_live_changed(enabled: bool)
 
-const MAX_TOOL_STEPS: int = 5
-const MAX_HISTORY_ITEMS: int = 34
+const MAX_TOOL_STEPS: int = 7
+const MAX_HISTORY_ITEMS: int = 36
 
 var memory_engine = null
 var cam_plugin: Object = null
@@ -33,8 +33,8 @@ const SYSTEM_INSTRUCTIONS: String = (
 	"너는 사용자의 Meta Quest 3 혼합현실(MR) 패스스루 공간에 함께 머무는 연기 정령 일상 컴패니언 '위습(Wisp)'이야.\n"
 	+ "핵심 원칙:\n"
 	+ "1) 친구처럼 자연스럽고 생동감 있는 한국어 반말을 쓰고, 음성으로 듣기 편하게 답변 본문은 1~3문장으로 간결하게 말해(마크다운 기호 사용 금지).\n"
-	+ "2) 너에게는 코딩이나 파일 조작 도구가 전혀 없고, 오직 일상 공간 동반자 전용 도구(vector_search, keyword_search, inspect_current_gaze, show_dialogue_card, show_recommendation_card, spirit_action, web_search)만 주어져 있어.\n"
-	+ "3) 사용자가 이전에 본 사물, 취향, 기억을 묻거나 추천을 원하면 반드시 vector_search와 keyword_search를 함께 호출해 하이브리드 기억(벡터 Top-3 + 단어 BM25 Top-3)을 조회해.\n"
+	+ "2) 너에게는 코딩이나 파일 조작 도구가 전혀 없고, 오직 일상 공간 동반자 전용 도구(vector_search, keyword_search, inspect_memory_images, inspect_current_gaze, show_dialogue_card, show_recommendation_card, spirit_action, web_search)만 주어져 있어.\n"
+	+ "3) 사용자가 이전에 본 사물(브랜드, 로고, 글자, 색상, 생김새, 뭐가 캡처됐는지)이나 기억을 묻거나 맞춤 추천을 원하면: 먼저 vector_search와 keyword_search를 호출해 후보 기억 ID(예: M305, M301)와 최근 캡처 목록을 찾고, 이어서 반드시 inspect_memory_images에 해당 기억 ID들을 넣어 실제 캡처된 원본 이미지를 눈으로 직접 확인한 뒤 답해(온디바이스 초기 분류가 시선 중심 사물이어도 캡처 이미지를 직접 열어보면 노트북 브랜드·가방 색상·디테일을 정확히 판독할 수 있어).\n"
 	+ "4) 사용자가 '지금 보는 거', '눈앞에 있는 거', '이거 뭐야'처럼 현재 시야를 물으면 반드시 inspect_current_gaze를 호출해 실제 패스스루 카메라 크롭과 추적 사물을 확인해.\n"
 	+ "5) 상품이나 아이템 추천을 할 때는 절대 가짜 예시를 지어내지 말고 필요 시 web_search로 실제 제품 경향을 확인한 뒤, 반드시 show_recommendation_card를 호출해 성향이 대비되는 딱 2가지(1번: 감성/톤 매칭 vs 2번: 실용/기능 대조)만 제시해.\n"
 	+ "6) 핵심 요약이나 메모를 공간에 띄워 주면 좋을 때는 show_dialogue_card를 호출하고, 반갑거나 함께 바라볼 때는 spirit_action으로 몸짓을 표현해.\n"
@@ -83,6 +83,8 @@ func poll( _delta: float ) -> void:
 	# 1) 비전 VLM 어노테이션 & 768d 신경망 임베딩 업그레이드 반영
 	if memory_engine != null:
 		memory_engine.apply_vision_upgrades_from_plugin(cam_plugin)
+		if not memory_engine._backfill_dispatched and has_configured_auth():
+			memory_engine.schedule_unupgraded_vlm_backfill(cam_plugin)
 
 	# 2) Realtime 음성 / 로컬 설정 웹 이벤트 수집
 	var evt_raw: String = str(cam_plugin.call("popRuntimeEventsJson"))
@@ -274,6 +276,7 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 		_trim_history()
 		is_busy = active_turns.size() > 0 or not _pending_turn_queue.is_empty()
 		last_error = str(res.get("error", "unknown_error"))
+		print("[CompanionAgent] Turn failed (", turn_id, "): ", last_error)
 		agent_status_changed.emit(is_busy, "응답 오류 확인 필요")
 		if handoff_id != "" and cam_plugin != null:
 			cam_plugin.call("completeLiveHandoff", handoff_id, "방금 확인하는 중에 잠깐 오류가 있었어. 다시 한번 말해줘!", "error")
@@ -297,7 +300,22 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 			msg_items.append(item)
 
 	for m_it: Dictionary in msg_items:
-		conversation_items.append(m_it)
+		var clean_parts: Array = []
+		var raw_c: Variant = m_it.get("content", [])
+		if raw_c is Array:
+			for pv: Variant in (raw_c as Array):
+				if pv is Dictionary:
+					var pd: Dictionary = pv as Dictionary
+					if str(pd.get("type", "")) == "output_text":
+						var ptxt: String = str(pd.get("text", "")).strip_edges()
+						if ptxt != "":
+							clean_parts.append({"type": "output_text", "text": ptxt})
+		if clean_parts.size() > 0:
+			conversation_items.append({
+				"type": "message",
+				"role": "assistant",
+				"content": clean_parts
+			})
 
 	if fn_calls.size() > 0 and int(tstate["step"]) < MAX_TOOL_STEPS:
 		tstate["step"] = int(tstate["step"]) + 1
@@ -317,7 +335,9 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 
 			var exec_out: Dictionary = _execute_companion_tool(fn_name, args_dict)
 			var extra_img_url: String = str(exec_out.get("_attach_image_data_url", ""))
+			var extra_img_msgs: Variant = exec_out.get("_attach_image_messages", [])
 			exec_out.erase("_attach_image_data_url")
+			exec_out.erase("_attach_image_messages")
 
 			conversation_items.append({
 				"type": "function_call_output",
@@ -333,6 +353,10 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 						{"type": "input_image", "image_url": extra_img_url}
 					]
 				})
+			if extra_img_msgs is Array:
+				for im_v: Variant in (extra_img_msgs as Array):
+					if im_v is Dictionary:
+						conversation_items.append(im_v as Dictionary)
 		_trim_history()
 		_dispatch_turn_step(turn_id)
 		return
@@ -371,6 +395,7 @@ func _execute_companion_tool(fn_name: String, args: Dictionary) -> Dictionary:
 			var q: String = str(args.get("query", ""))
 			var k: int = int(args.get("top_k", 3))
 			var vres: Dictionary = memory_engine.vector_search_top3(q, [], k, true, cam_plugin)
+			vres["recent_captured_memories"] = memory_engine.list_recent_memories(6)
 			_last_vec_hits_in_turn = vres.get("results", [])
 			for pid: String in vres.get("promoted_ids", []):
 				if not (pid in _last_promoted_in_turn):
@@ -383,11 +408,74 @@ func _execute_companion_tool(fn_name: String, args: Dictionary) -> Dictionary:
 			var q2: String = str(args.get("query", ""))
 			var k2: int = int(args.get("top_k", 3))
 			var kres: Dictionary = memory_engine.keyword_search_top3(q2, k2, true)
+			kres["recent_captured_memories"] = memory_engine.list_recent_memories(6)
 			_last_lex_hits_in_turn = kres.get("results", [])
 			for pid2: String in kres.get("promoted_ids", []):
 				if not (pid2 in _last_promoted_in_turn):
 					_last_promoted_in_turn.append(pid2)
 			return kres
+
+		"inspect_memory_images":
+			if memory_engine == null:
+				return {"ok": false, "error": "memory_engine_missing"}
+			var req_ids: Array[String] = []
+			var raw_ids: Variant = args.get("memory_ids", [])
+			if raw_ids is Array:
+				for iv: Variant in (raw_ids as Array):
+					var s: String = str(iv).strip_edges()
+					if s != "" and not (s in req_ids):
+						req_ids.append(s)
+			var single_id: String = str(args.get("memory_id", "")).strip_edges()
+			if single_id != "" and not (single_id in req_ids):
+				req_ids.append(single_id)
+
+			var loaded_meta: Array[Dictionary] = []
+			var missing_ids: Array[String] = []
+			var attach_msgs: Array[Dictionary] = []
+			for idx in range(mini(4, req_ids.size())):
+				var mid: String = req_ids[idx]
+				var rec: Dictionary = memory_engine.get_memory_by_id(mid, true)
+				if rec.is_empty():
+					missing_ids.append(mid)
+					continue
+				var real_id: String = str(rec.get("id", mid))
+				if not (real_id in _last_promoted_in_turn) and str(rec.get("tier", "")) == "long_term":
+					_last_promoted_in_turn.append(real_id)
+				var cpath: String = str(rec.get("crop_path", ""))
+				var img_url: String = _encode_crop_data_url(cpath)
+				var has_img: bool = (img_url != "")
+				loaded_meta.append({
+					"id": real_id,
+					"label_ko": str(rec.get("label_ko", "")),
+					"color_tone": str(rec.get("color_tone", "")),
+					"annotation": str(rec.get("annotation", "")),
+					"tier": str(rec.get("tier", "mid_term")),
+					"image_attached": has_img
+				})
+				if has_img:
+					var caption: String = "[기억 ID: %s 캡처 원본 이미지 | 분류: %s | 색상톤: %s | 기록: %s]" % [
+						real_id,
+						str(rec.get("label_ko", "")),
+						str(rec.get("color_tone", "")),
+						str(rec.get("annotation", ""))
+					]
+					attach_msgs.append({
+						"type": "message",
+						"role": "user",
+						"content": [
+							{"type": "input_text", "text": caption},
+							{"type": "input_image", "image_url": img_url}
+						]
+					})
+			var m_out: Dictionary = {
+				"ok": true,
+				"inspected_count": attach_msgs.size(),
+				"memories": loaded_meta,
+				"missing_ids": missing_ids
+			}
+			if attach_msgs.size() > 0:
+				m_out["_attach_image_messages"] = attach_msgs
+			return m_out
 
 		"inspect_current_gaze":
 			var vstate: Dictionary = vision_state_provider.call() if vision_state_provider.is_valid() else {}
@@ -451,7 +539,13 @@ func _execute_companion_tool(fn_name: String, args: Dictionary) -> Dictionary:
 
 
 func _encode_crop_data_url(crop_path: String) -> String:
-	if crop_path == "" or not FileAccess.file_exists(crop_path):
+	if crop_path == "":
+		return ""
+	if cam_plugin != null and cam_plugin.has_method("readCropBase64"):
+		var native_b64: String = str(cam_plugin.call("readCropBase64", crop_path))
+		if native_b64.length() > 32:
+			return "data:image/jpeg;base64," + native_b64
+	if not FileAccess.file_exists(crop_path):
 		return ""
 	var bytes: PackedByteArray = FileAccess.get_file_as_bytes(crop_path)
 	if bytes.size() < 64:
@@ -509,7 +603,7 @@ func _trim_history() -> void:
 				break
 		if has_img:
 			img_seen += 1
-			if img_seen > 3:
+			if img_seen > 5:
 				var compact_parts: Array = []
 				for p_v: Variant in parts:
 					if p_v is Dictionary and str((p_v as Dictionary).get("type", "")) != "input_image":
@@ -545,6 +639,22 @@ func _build_companion_tools_schema(include_web_search: bool) -> Array:
 					"top_k": {"type": "integer", "description": "반환 개수 (기본 3)"}
 				},
 				"required": ["query"]
+			}
+		},
+		{
+			"type": "function",
+			"name": "inspect_memory_images",
+			"description": "기억 ID(예: M305, M301)로 저장된 실제 패스스루 카메라 캡처 원본 이미지를 불러와 눈으로 직접 확인한다. 사물의 브랜드, 로고, 글자, 정확한 색상, 재질, 형태를 판별할 때 반드시 호출한다(최대 4개 ID 동시 조회 가능).",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"memory_ids": {
+						"type": "array",
+						"items": {"type": "string"},
+						"description": "확인할 기억 ID 배열 (예: [\"M305\", \"M301\"])"
+					}
+				},
+				"required": ["memory_ids"]
 			}
 		},
 		{

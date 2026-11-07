@@ -366,6 +366,21 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     }
 
     @UsedByGodot
+    fun readCropBase64(cropPath: String): String {
+        if (cropPath.isBlank()) return ""
+        return try {
+            val f = File(cropPath)
+            if (!f.exists() || !f.isFile) return ""
+            val bytes = f.readBytes()
+            if (bytes.size <= 32) return ""
+            android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+        } catch (t: Throwable) {
+            Log.w(TAG, "readCropBase64 failed ($cropPath): ${t.message}")
+            ""
+        }
+    }
+
+    @UsedByGodot
     fun captureLiveGazeSnapshotJson(): String {
         val out = JSONObject()
         try {
@@ -1209,18 +1224,10 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
                     val area = (xmax - xmin) * (ymax - ymin)
                     if (area < 0.006f || area > 0.72f) continue
 
-                    // Skip user's own hand/arm misclassified as person
-                    if (rawLabel == "person") {
-                        var overlapsHand = false
-                        for (hb in handBoxes) {
-                            if (boxIoU(xmin, ymin, xmax, ymax, hb[0], hb[1], hb[2], hb[3]) > 0.25f) {
-                                overlapsHand = true
-                                break
-                            }
-                        }
-                        if (overlapsHand || area > 0.42f) continue
-                    }
-                    detections.add(RawDetection(rawLabel, score, xmin, ymin, xmax, ymax))
+                    // Do not index humans/hands as inanimate object memories; remap indoor false-positive 'toilet'
+                    if (rawLabel == "person") continue
+                    val normalizedLabel = if (rawLabel == "toilet") "desk_object" else rawLabel
+                    detections.add(RawDetection(normalizedLabel, score, xmin, ymin, xmax, ymax))
                 }
             } catch (t: Throwable) {
                 Log.w(TAG, "ObjectDetector frame err: ${t.message}")
@@ -1521,17 +1528,46 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     private fun captureCropAndVisualSignature(bmp: Bitmap, tr: TrackState) {
         val w = bmp.width
         val h = bmp.height
-        val padX = (tr.xmax - tr.xmin) * 0.12f
-        val padY = (tr.ymax - tr.ymin) * 0.12f
+        val padX = (tr.xmax - tr.xmin) * 0.16f
+        val padY = (tr.ymax - tr.ymin) * 0.16f
         val x0 = ((tr.xmin - padX) * w).toInt().coerceIn(0, w - 2)
         val y0 = ((tr.ymin - padY) * h).toInt().coerceIn(0, h - 2)
         val x1 = ((tr.xmax + padX) * w).toInt().coerceIn(x0 + 2, w)
         val y1 = ((tr.ymax + padY) * h).toInt().coerceIn(y0 + 2, h)
 
         val cropBmp = Bitmap.createBitmap(bmp, x0, y0, x1 - x0, y1 - y0)
-        val out = ByteArrayOutputStream()
-        cropBmp.compress(Bitmap.CompressFormat.JPEG, 86, out)
-        tr.bestCropBytes = out.toByteArray()
+
+        // Prefer full-resolution passthrough camera JPEG so brand logos, text, and fine textures are crisp!
+        var hiResBytes: ByteArray? = null
+        val fullJpeg = latestJpeg.get()
+        if (fullJpeg.size > 128) {
+            runCatching {
+                val fullBmp = BitmapFactory.decodeByteArray(fullJpeg, 0, fullJpeg.size)
+                if (fullBmp != null) {
+                    val fw = fullBmp.width
+                    val fh = fullBmp.height
+                    val fx0 = ((tr.xmin - padX) * fw).toInt().coerceIn(0, fw - 2)
+                    val fy0 = ((tr.ymin - padY) * fh).toInt().coerceIn(0, fh - 2)
+                    val fx1 = ((tr.xmax + padX) * fw).toInt().coerceIn(fx0 + 2, fw)
+                    val fy1 = ((tr.ymax + padY) * fh).toInt().coerceIn(fy0 + 2, fh)
+                    var hiCrop = Bitmap.createBitmap(fullBmp, fx0, fy0, fx1 - fx0, fy1 - fy0)
+                    if (hiCrop.width > 768) {
+                        val scaledH = (hiCrop.height * 768 / hiCrop.width).coerceAtLeast(32)
+                        hiCrop = Bitmap.createScaledBitmap(hiCrop, 768, scaledH, true)
+                    }
+                    val hiOut = ByteArrayOutputStream()
+                    hiCrop.compress(Bitmap.CompressFormat.JPEG, 88, hiOut)
+                    hiResBytes = hiOut.toByteArray()
+                }
+            }
+        }
+        if (hiResBytes != null && hiResBytes!!.size > 64) {
+            tr.bestCropBytes = hiResBytes
+        } else {
+            val out = ByteArrayOutputStream()
+            cropBmp.compress(Bitmap.CompressFormat.JPEG, 88, out)
+            tr.bestCropBytes = out.toByteArray()
+        }
 
         // Extract genuine pixel color tone + 24-bin RGB/spatial visual signature for multimodal embedding
         var sumR = 0f; var sumG = 0f; var sumB = 0f; var cnt = 0

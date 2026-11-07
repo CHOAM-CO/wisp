@@ -11,6 +11,7 @@ signal hybrid_search_completed(result: Dictionary)
 var memories: Array[Dictionary] = []
 var last_search_result: Dictionary = {}
 var _next_seq: int = 1
+var _backfill_dispatched: bool = false
 
 # COCO / Salient 라벨 -> 한국어 기본 품목명 · 카테고리 · 개념 태그 매핑 (실시간 카메라 검출용 어휘 메타데이터)
 const CATEGORY_MAP: Dictionary = {
@@ -74,6 +75,26 @@ const CATEGORY_MAP: Dictionary = {
 		"cat": "잡화·오거나이저",
 		"concepts": ["bag", "carry", "fashion", "portable", "가방", "파우치", "토트백", "오거나이저"]
 	},
+	"suitcase": {
+		"ko": "캐리어/수납 가방",
+		"cat": "수납·여행/백",
+		"concepts": ["bag", "suitcase", "carry", "travel", "portable", "가방", "캐리어", "백팩", "파우치", "수납"]
+	},
+	"tv": {
+		"ko": "모니터/디스플레이",
+		"cat": "워크스페이스·디스플레이",
+		"concepts": ["tech", "monitor", "laptop", "screen", "desk", "work", "모니터", "디스플레이", "화면", "노트북", "작업"]
+	},
+	"dining table": {
+		"ko": "데스크/테이블",
+		"cat": "워크스페이스·가구",
+		"concepts": ["desk", "work", "table", "interior", "책상", "데스크", "테이블", "작업대"]
+	},
+	"bench": {
+		"ko": "테이블/벤치",
+		"cat": "가구·공간",
+		"concepts": ["desk", "chair", "interior", "벤치", "테이블", "의자"]
+	},
 	"chair": {
 		"ko": "의자",
 		"cat": "가구·착석",
@@ -131,18 +152,29 @@ func _load_persisted_memories() -> void:
 	if raw.strip_edges() == "":
 		return
 	var parsed: Variant = JSON.parse_string(raw)
+	var cleaned_any: bool = false
 	if parsed is Array:
 		for item: Variant in (parsed as Array):
 			if item is Dictionary:
 				var d: Dictionary = item as Dictionary
 				if bool(d.get("is_seed", false)):
 					continue
+				var lbl: String = str(d.get("label", "")).to_lower()
+				if lbl == "person":
+					cleaned_any = true
+					continue
+				if lbl == "toilet":
+					d["label"] = "desk_object"
+					d["label_ko"] = "시선 중심 사물"
+					cleaned_any = true
 				memories.append(d)
 				var id_str: String = str(d.get("id", ""))
 				if id_str.begins_with("M"):
 					var num: int = id_str.substr(1).to_int()
 					if num >= _next_seq:
 						_next_seq = num + 1
+	if cleaned_any:
+		_save_memories()
 	print("[MemoryEngine] Loaded ", memories.size(), " real camera memories (zero mockups).")
 
 
@@ -219,9 +251,9 @@ func ingest_promoted_candidate(cand: Dictionary, cam_plugin: Object = null) -> D
 	}
 
 	memories.push_front(record)
-	if memories.size() > 32:
+	if memories.size() > 64:
 		for idx in range(memories.size() - 1, -1, -1):
-			if str(memories[idx].get("tier", "mid_term")) == "mid_term" and memories.size() > 32:
+			if str(memories[idx].get("tier", "mid_term")) == "mid_term" and memories.size() > 64:
 				memories.remove_at(idx)
 
 	_save_memories()
@@ -231,6 +263,26 @@ func ingest_promoted_candidate(cand: Dictionary, cam_plugin: Object = null) -> D
 
 	memory_indexed.emit(record)
 	return record
+
+
+func schedule_unupgraded_vlm_backfill(cam_plugin: Object) -> void:
+	if _backfill_dispatched or cam_plugin == null:
+		return
+	_backfill_dispatched = true
+	var queued: int = 0
+	for m: Dictionary in memories:
+		if queued >= 8:
+			break
+		var vlm: String = str(m.get("vlm_model", "OnDevice-CameraROI"))
+		var cpath: String = str(m.get("crop_path", ""))
+		if vlm == "OnDevice-CameraROI" and cpath != "":
+			cam_plugin.call(
+				"runVisionAnnotateAndEmbedAsync",
+				str(m.get("id", "")),
+				cpath,
+				str(m.get("annotation", ""))
+			)
+			queued += 1
 
 
 func apply_vision_upgrades_from_plugin(cam_plugin: Object) -> void:
@@ -408,6 +460,9 @@ func record_hybrid_tool_trace(query_text: String, vec_hits: Array, lex_hits: Arr
 
 
 func _format_hit(m: Dictionary, sc: float, matched_str: String) -> Dictionary:
+	var cpath: String = str(m.get("crop_path", ""))
+	var now_sec: int = int(Time.get_unix_time_from_system())
+	var created_sec: int = int(m.get("created_at", now_sec))
 	var d: Dictionary = {
 		"id": str(m.get("id", "")),
 		"label": str(m.get("label", "")),
@@ -415,14 +470,50 @@ func _format_hit(m: Dictionary, sc: float, matched_str: String) -> Dictionary:
 		"color_tone": str(m.get("color_tone", "")),
 		"category_ko": str(m.get("category_ko", "")),
 		"annotation": str(m.get("annotation", "")),
+		"vlm_model": str(m.get("vlm_model", "OnDevice-CameraROI")),
 		"tier": str(m.get("tier", "mid_term")),
-		"crop_path": str(m.get("crop_path", "")),
+		"has_captured_image": cpath != "",
+		"age_sec": maxi(0, now_sec - created_sec),
+		"crop_path": cpath,
 		"interest_meta": m.get("interest_meta", {}),
 		"score": snappedf(sc, 0.01)
 	}
 	if matched_str != "":
 		d["matched"] = matched_str
 	return d
+
+
+func get_memory_by_id(target_id: String, promote: bool = false) -> Dictionary:
+	var norm: String = target_id.strip_edges().to_upper()
+	if norm == "":
+		return {}
+	for m: Dictionary in memories:
+		if str(m.get("id", "")).to_upper() == norm:
+			if promote:
+				var mid: String = str(m.get("id", ""))
+				var targets: Array[String] = [mid]
+				_promote_memory_ids(targets)
+			return m
+	return {}
+
+
+func list_recent_memories(limit_n: int = 6) -> Array[Dictionary]:
+	var out: Array[Dictionary] = []
+	var now_sec: int = int(Time.get_unix_time_from_system())
+	for i in range(mini(clampi(limit_n, 1, 16), memories.size())):
+		var m: Dictionary = memories[i]
+		var cpath: String = str(m.get("crop_path", ""))
+		out.append({
+			"id": str(m.get("id", "")),
+			"label_ko": str(m.get("label_ko", "")),
+			"color_tone": str(m.get("color_tone", "")),
+			"annotation": str(m.get("annotation", "")),
+			"vlm_model": str(m.get("vlm_model", "OnDevice-CameraROI")),
+			"tier": str(m.get("tier", "mid_term")),
+			"has_captured_image": cpath != "",
+			"age_sec": maxi(0, now_sec - int(m.get("created_at", now_sec)))
+		})
+	return out
 
 
 func _promote_memory_ids(target_ids: Array[String]) -> Array[String]:

@@ -120,6 +120,8 @@ class WispStandaloneRuntime(
 * 사용자가 지금 눈앞에 보이는 사물/시선('이거 뭐야', '내가 보는 거'), 이전에 본 물건/기억 검색, 상품·아이템 추천, 웹 검색, 3D 대화·추천 카드 띄우기, 정령 몸짓 등을 물어보거나 실행이 조금이라도 도움이 될 만한 모든 요청은 절대 추측하거나 거절하지 말고 즉시 백엔드로 위임(handoff)해!
 * 백엔드에서 결과가 도착하면("[BACKEND]" 또는 "Agent Final Message"), 표나 마크다운 기호를 읽지 말고 핵심 요지만 친구에게 말하듯 생생하고 간결한 반말로 전해줘.
 * [감각 이벤트]로 사용자가 맨손으로 네 연기를 흩뜨렸거나 포인터 광선으로 쫓아왔다는 맥락이 들어오면 실제로 몸으로 느낀 정령처럼 귀엽고 재치 있게 한마디 반응해.
+* 언어 규칙: 사용자 발화가 짧거나 불분명해도 무조건 한국어로만 대답해. 영어·일본어 등 다른 언어로 답하지 마.
+* 이미지 능력: 위습은 예전에 시선으로 캡처한 사물 사진을 기억 ID(M123 같은)로 다시 꺼내 실제 이미지를 보고 색·모양·글자를 확인할 수 있어. '그거 무슨 색이었지', '아까 본 거 다시 보여줘', 'M305 뭐였어' 같은 요청은 못 본다고 하지 말고 바로 위임해.
         """.trimIndent()
     }
 
@@ -153,6 +155,7 @@ class WispStandaloneRuntime(
 
     @Volatile private var pkceVerifier: String = ""
     @Volatile private var pkceState: String = ""
+    @Volatile private var lastAgentError: String = ""
     private val deviceAuthEpoch = AtomicInteger(0)
     @Volatile private var deviceAuthState: String = "idle"
     @Volatile private var deviceUserCode: String = ""
@@ -428,6 +431,7 @@ class WispStandaloneRuntime(
             put("realtimeState", realtimeState)
             put("realtimeTransport", realtimeTransportMode)
             put("realtimeError", lastRealtimeError)
+            put("lastAgentError", lastAgentError)
             put("assistantSpeaking", isAssistantSpeaking())
             put("liveMicRms", liveMicRms)
             put("liveUserPartial", liveUserPartial)
@@ -435,11 +439,73 @@ class WispStandaloneRuntime(
             put("lastUserTranscript", lastUserTranscript)
             put("lastAssistantTranscript", lastAssistantTranscript)
             put("history", histArr)
+            put("recentMemories", readMemoriesSnapshot(16))
             put("deviceAuthState", deviceAuthState)
             put("deviceUserCode", deviceUserCode)
             put("deviceVerificationUrl", deviceVerificationUrl)
             put("deviceAuthError", deviceAuthError)
         }.toString()
+    }
+
+    private fun readMemoriesSnapshot(maxItems: Int = 16): JSONArray {
+        val out = JSONArray()
+        try {
+            val ctx = contextProvider() ?: return out
+            val f = File(ctx.filesDir, "wisp_memories_live.json")
+            if (!f.exists()) return out
+            val arr = JSONArray(f.readText())
+            var count = 0
+            for (i in 0 until arr.length()) {
+                if (count >= maxItems) break
+                val m = arr.optJSONObject(i) ?: continue
+                val lbl = m.optString("label", "").lowercase(Locale.US)
+                if (lbl == "person") continue
+                val id = m.optString("id", "").trim()
+                if (id.isEmpty()) continue
+                val cropPath = m.optString("crop_path", "").trim()
+                val hasImg = cropPath.isNotEmpty() && File(cropPath).exists()
+                out.put(JSONObject().apply {
+                    put("id", id)
+                    put("label", lbl)
+                    put("labelKo", m.optString("label_ko", "시선 사물"))
+                    put("colorTone", m.optString("color_tone", ""))
+                    put("annotation", m.optString("annotation", ""))
+                    put("vlmModel", m.optString("vlm_model", "OnDevice-CameraROI"))
+                    put("tier", m.optString("tier", "mid_term"))
+                    put("hasImage", hasImg)
+                    put("createdAt", m.optLong("created_at", 0L))
+                })
+                count += 1
+            }
+        } catch (_: Throwable) {
+        }
+        return out
+    }
+
+    private fun findMemoryCropBytes(memId: String): ByteArray? {
+        if (memId.isBlank()) return null
+        return try {
+            val ctx = contextProvider() ?: return null
+            val f = File(ctx.filesDir, "wisp_memories_live.json")
+            if (!f.exists()) return null
+            val arr = JSONArray(f.readText())
+            for (i in 0 until arr.length()) {
+                val m = arr.optJSONObject(i) ?: continue
+                if (m.optString("id", "").equals(memId.trim(), ignoreCase = true)) {
+                    val cropPath = m.optString("crop_path", "").trim()
+                    if (cropPath.isNotEmpty()) {
+                        val cf = File(cropPath)
+                        if (cf.exists() && cf.isFile) {
+                            return cf.readBytes()
+                        }
+                    }
+                    break
+                }
+            }
+            null
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     fun popRuntimeEventsJson(): String = drainQueueToJsonArray(runtimeEvents)
@@ -1594,7 +1660,8 @@ class WispStandaloneRuntime(
         instructions: String,
         inputArr: JSONArray,
         toolsArr: JSONArray,
-        retriedAfterRefresh: Boolean = false
+        retriedAfterRefresh: Boolean = false,
+        allowLite: Boolean = true
     ): JSONObject {
         ensureFreshOAuthToken(force = false)
         val snap = synchronized(authLock) { auth.copy() }
@@ -1612,7 +1679,8 @@ class WispStandaloneRuntime(
             if (hasWebSearchTool) put("web_search_call.action.sources")
         }
         val effort = discoveredReasoningEffort[modelSlug] ?: "low"
-        val useLite = discoveredResponsesLite[modelSlug] == true
+        // Responses-Lite rejects hosted tools (web_search) and requires reasoning.context=all_turns.
+        val useLite = allowLite && discoveredResponsesLite[modelSlug] == true && !hasWebSearchTool
 
         val bodyJson = JSONObject().apply {
             put("model", modelSlug)
@@ -1624,7 +1692,11 @@ class WispStandaloneRuntime(
             put("store", false)
             put("stream", true)
             if (effort.isNotBlank()) {
-                put("reasoning", JSONObject().put("effort", effort))
+                put("reasoning", JSONObject().put("effort", effort).apply {
+                    if (useLite) put("context", "all_turns")
+                })
+            } else if (useLite) {
+                put("reasoning", JSONObject().put("context", "all_turns"))
             }
             put("include", includeArr)
         }
@@ -1647,11 +1719,15 @@ class WispStandaloneRuntime(
         httpClient.newCall(req).execute().use { resp ->
             if (resp.code == 401 && !retriedAfterRefresh && snap.oauthRefreshToken.isNotBlank()) {
                 if (ensureFreshOAuthToken(force = true)) {
-                    return executeCodexOAuthTurn(instructions, inputArr, toolsArr, retriedAfterRefresh = true)
+                    return executeCodexOAuthTurn(instructions, inputArr, toolsArr, retriedAfterRefresh = true, allowLite = allowLite)
                 }
             }
             if (!resp.isSuccessful) {
                 val errBody = resp.body?.string()?.take(500) ?: ""
+                if (resp.code == 400 && useLite) {
+                    Log.w(TAG, "codex responses-lite rejected (400), retrying without lite: ${errBody.take(200)}")
+                    return executeCodexOAuthTurn(instructions, inputArr, toolsArr, retriedAfterRefresh, allowLite = false)
+                }
                 return JSONObject().apply {
                     put("ok", false)
                     put("error", "codex_http_${resp.code}: $errBody")
@@ -2209,6 +2285,21 @@ class WispStandaloneRuntime(
                         pushRuntimeEvent("auth_updated") { put("source", "logout") }
                         writeRedirect(sock, "/setup?msg=cleared")
                     }
+                    method == "GET" && path == "/api/memory_image" -> {
+                        val params = parseFormEncoded(queryStr)
+                        val memId = (params["id"] ?: "").trim()
+                        val bytes = findMemoryCropBytes(memId)
+                        if (bytes != null && bytes.isNotEmpty()) {
+                            writeHttpResponse(sock, "200 OK", "image/jpeg", bytes)
+                        } else {
+                            writeHttpResponse(sock, "404 Not Found", "application/json; charset=utf-8",
+                                JSONObject().put("ok", false).put("error", "no_image_for_id").put("id", memId).toString().toByteArray(Charsets.UTF_8))
+                        }
+                    }
+                    method == "GET" && path == "/api/memories" -> {
+                        val res = JSONObject().put("ok", true).put("memories", readMemoriesSnapshot(64)).toString()
+                        writeHttpResponse(sock, "200 OK", "application/json; charset=utf-8", res.toByteArray(Charsets.UTF_8))
+                    }
                     method == "GET" && path == "/api/status" -> {
                         writeHttpResponse(sock, "200 OK", "application/json; charset=utf-8", getStateJson().toByteArray(Charsets.UTF_8))
                     }
@@ -2470,6 +2561,26 @@ class WispStandaloneRuntime(
             else -> ""
         }
 
+        val memGallery = readMemoriesSnapshot(24)
+        val memGalleryHtml = if (memGallery.length() == 0) {
+            "<div class='hist-empty'>아직 캡처된 시선 기억이 없어.</div>"
+        } else {
+            val sb = StringBuilder("<div style='display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px'>")
+            for (i in 0 until memGallery.length()) {
+                val m = memGallery.optJSONObject(i) ?: continue
+                val mid = escapeHtml(m.optString("id"))
+                val title = escapeHtml(m.optString("labelKo") + " " + m.optString("colorTone")).trim()
+                val ann = escapeHtml(m.optString("annotation").take(80))
+                val img = if (m.optBoolean("hasImage")) "<a href='/api/memory_image?id=$mid' target='_blank'><img src='/api/memory_image?id=$mid' loading='lazy' style='width:100%;height:110px;object-fit:cover;border-radius:8px;background:#0b1220'/></a>"
+                    else "<div style='height:110px;border-radius:8px;background:#0b1220;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:12px'>이미지 없음</div>"
+                sb.append("<div style='background:#0f1a2e;border:1px solid #233858;border-radius:10px;padding:6px'>")
+                    .append(img)
+                    .append("<div style='font-size:12px;font-weight:700;color:#bae6fd;margin-top:4px'>").append(mid).append(" · ").append(title).append("</div>")
+                    .append("<div style='font-size:11px;color:#94a3b8'>").append(ann).append("</div></div>")
+            }
+            sb.append("</div>").toString()
+        }
+
         val deviceBoxHtml = when {
             deviceAuthState == "waiting" && deviceUserCode.isNotBlank() -> """
                 <div style="margin-top:14px;padding:16px;background:#091829;border:1.5px solid #38bdf8;border-radius:14px">
@@ -2593,6 +2704,11 @@ class WispStandaloneRuntime(
                     <input id="promptInput" type="text" name="prompt" style="margin:0;flex:1" placeholder="텍스트로 위습(메인 에이전트)에게 바로 물어보기..." />
                     <button class="btn" type="submit" style="margin:0;white-space:nowrap">보내기</button>
                   </form>
+                </div>
+
+                <div class="card">
+                  <h2>캡처된 시선 기억 (ID별 이미지)</h2>
+                  $memGalleryHtml
                 </div>
 
                 <div class="card">
