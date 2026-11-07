@@ -260,9 +260,6 @@ func apply_vision_upgrades_from_plugin(cam_plugin: Object) -> void:
 					)
 				if u.has("vlmModel") and str(u["vlmModel"]).length() > 0:
 					m["vlm_model"] = str(u["vlmModel"])
-				if u.has("embedding768") and u["embedding768"] is Array and (u["embedding768"] as Array).size() == EMBED_DIM:
-					m["neural_embedding_768"] = u["embedding768"]
-					m["embed_model"] = str(u.get("embedModel", "text-embedding-3-small (768d)"))
 				changed = true
 				memory_upgraded.emit(m)
 				break
@@ -275,37 +272,18 @@ func vector_search_top3(
 	visual_sig: Array = [],
 	top_k: int = 3,
 	promote_hits: bool = true,
-	cam_plugin: Object = null
+	_cam_plugin: Object = null
 ) -> Dictionary:
 	var q: String = query_text.strip_edges()
 	if memories.is_empty():
 		return {"query": q, "total_memories": 0, "results": [], "promoted_ids": []}
 
 	var local_q_vec: Array[float] = _compute_multimodal_768d(q, visual_sig)
-	var neural_q_vec: Array = []
-	var any_neural_doc: bool = false
-	for m: Dictionary in memories:
-		var nv: Variant = m.get("neural_embedding_768", [])
-		if nv is Array and (nv as Array).size() == EMBED_DIM:
-			any_neural_doc = true
-			break
-
-	if any_neural_doc and cam_plugin != null and q != "":
-		var emb_raw: String = str(cam_plugin.call("fetchQueryEmbeddingSync", q))
-		if emb_raw.length() > 16:
-			var parsed_q: Variant = JSON.parse_string(emb_raw)
-			if parsed_q is Array and (parsed_q as Array).size() == EMBED_DIM:
-				neural_q_vec = parsed_q as Array
 
 	var scored: Array[Dictionary] = []
 	for m: Dictionary in memories:
-		var sim: float = 0.0
-		var nv: Variant = m.get("neural_embedding_768", [])
-		if neural_q_vec.size() == EMBED_DIM and nv is Array and (nv as Array).size() == EMBED_DIM:
-			sim = _cosine_sim(neural_q_vec, nv as Array)
-		else:
-			var lv: Array = m.get("local_embedding_768", m.get("embedding_768", []))
-			sim = _cosine_sim(local_q_vec, lv)
+		var lv: Array = m.get("local_embedding_768", m.get("embedding_768", []))
+		var sim: float = _cosine_sim(local_q_vec, lv)
 		scored.append({"mem": m, "score": sim})
 
 	scored.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return float(a["score"]) > float(b["score"]))

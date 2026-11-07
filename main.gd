@@ -41,18 +41,21 @@ var rgb_pinch_prev: bool = false
 var openxr_bare_left_active: bool = false
 var openxr_bare_right_active: bool = false
 var rgb_hand_active: bool = false
-var y_hold_timer: float = -1.0
-var y_ptt_active: bool = false
 var left_x_held: bool = false
 var left_y_held: bool = false
 var combo_reset_timer: float = 0.0
 var combo_reset_fired: bool = false
 var ray_click_queued: bool = false
+var voice_live_enabled: bool = false
 
-# 공간 룬 독 (A 시선 / B 기억 / X 모드 / Y 대화 / ⚙ 설정) — 홈 기준 고정으로 도망 중에도 터치 안정성 확보
+# 공간 룬 독 (A 시선 / B 기억 / X 모드 / 음성 ON·OFF / ⚙ 설정) — 홈 기준 고정으로 도망 중에도 터치 안정성 확보
 var spirit_runes_root: Node3D
 var rune_items: Array[Dictionary] = []
 var rune_cooldown: float = 0.0
+var tex_mic_on: ImageTexture = null
+var tex_mic_off: ImageTexture = null
+var voice_rune_icon_mat: StandardMaterial3D = null
+var voice_rune_label: Label3D = null
 
 # 모드 전환·안내 토스트
 var toast_root: Node3D
@@ -146,6 +149,7 @@ func _ready() -> void:
 	companion_agent.agent_status_changed.connect(_on_agent_status_changed)
 	companion_agent.auth_required_prompt.connect(_on_auth_required_prompt)
 	companion_agent.web_reset_requested.connect(_action_reset_demo)
+	companion_agent.voice_live_changed.connect(_on_voice_live_changed)
 
 	_setup_environment()
 	_build_smoke_spirit()
@@ -268,8 +272,6 @@ func _on_left_button_pressed(btn_name: String) -> void:
 	elif btn_name == "by_button":
 		left_y_held = true
 		combo_reset_fired = false
-		y_hold_timer = 0.0
-		y_ptt_active = false
 	elif btn_name == "trigger_click":
 		ray_click_queued = true
 	elif btn_name == "menu_button":
@@ -284,23 +286,11 @@ func _on_left_button_released(btn_name: String) -> void:
 		if should_toggle:
 			_action_toggle_demo_mode()
 	elif btn_name == "by_button":
+		var should_voice_toggle: bool = left_y_held and not combo_reset_fired
 		left_y_held = false
 		combo_reset_timer = 0.0
-		if combo_reset_fired:
-			y_hold_timer = -1.0
-			y_ptt_active = false
-			return
-		if y_ptt_active:
-			y_ptt_active = false
-			y_hold_timer = -1.0
-			if cam_plugin != null:
-				var stt_mode: String = str(cam_plugin.call("finishPttCapture"))
-				_show_toast("음성 질문 처리 중 (%s)" % stt_mode, 1.8)
-			else:
-				_action_trigger_query("컨트롤러 Y PTT")
-		elif y_hold_timer >= 0.0:
-			y_hold_timer = -1.0
-			_action_trigger_query("컨트롤러 Y")
+		if should_voice_toggle:
+			_action_toggle_voice_live()
 
 
 func _action_toggle_vision_bbox() -> void:
@@ -333,9 +323,39 @@ func _action_open_setup_browser() -> void:
 	_speak_or_chime("", "pinch")
 	if cam_plugin != null:
 		cam_plugin.call("openSetupBrowser")
-		_show_toast("2D 브라우저에서 Wisp 로그인·설정 창을 열었어!", 2.2)
+		_show_toast("2D 브라우저에서 Wisp 음성·단독 세션 패널을 열었어!", 2.2)
 	else:
 		_show_toast("퀘스트 기기에서 http://localhost:1455/setup 창이 열려", 2.0)
+
+
+func _action_toggle_voice_live() -> void:
+	spirit.notify_user_or_agent_activity()
+	if not companion_agent.has_configured_auth():
+		_speak_or_chime("", "mode")
+		_show_toast("먼저 ⚙ 설정을 눌러 ChatGPT 구독 로그인을 연결해줘!", 2.4)
+		_action_open_setup_browser()
+		return
+
+	if cam_plugin != null:
+		voice_live_enabled = bool(cam_plugin.call("toggleVoiceLive"))
+	else:
+		voice_live_enabled = not voice_live_enabled
+
+	if voice_live_enabled:
+		spirit.trigger_named_action("nod", "warm")
+		_speak_or_chime("", "promote")
+		_show_toast("음성 켜짐 · GPT Live 실시간 대화 시작", 2.0)
+	else:
+		_speak_or_chime("", "mode")
+		_show_toast("음성 꺼짐 · 마이크 음소거", 1.8)
+	_update_rune_highlights()
+	_refresh_xray_panel()
+
+
+func _on_voice_live_changed(enabled: bool) -> void:
+	voice_live_enabled = enabled
+	_update_rune_highlights()
+	_refresh_xray_panel()
 
 
 func _action_trigger_query(source_tag: String) -> void:
@@ -344,7 +364,7 @@ func _action_trigger_query(source_tag: String) -> void:
 	_speak_or_chime("", "pinch")
 
 	if not companion_agent.has_configured_auth():
-		_show_toast("먼저 ⚙ 설정 룬을 눌러 로그인/API 키를 연결해줘!", 2.4)
+		_show_toast("먼저 ⚙ 설정 룬을 눌러 ChatGPT 구독 로그인을 연결해줘!", 2.4)
 		_action_open_setup_browser()
 		return
 
@@ -366,6 +386,7 @@ func _action_reset_demo() -> void:
 	companion_agent.reset_conversation()
 	if cam_plugin != null:
 		cam_plugin.call("resetVisionSession")
+		cam_plugin.call("clearConversationHistory")
 	rec_card_root.visible = false
 	dialogue_card_root.visible = false
 	_reanchor_near_user()
@@ -534,31 +555,99 @@ func _on_spirit_chased_by_pointer(pointer_source: String) -> void:
 	)
 
 
+func _make_mic_icon_texture(is_on: bool) -> ImageTexture:
+	var sz: int = 64
+	var img := Image.create(sz, sz, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0.0, 0.0, 0.0, 0.0))
+
+	var body_col: Color = Color(0.16, 0.92, 0.48, 1.0) if is_on else Color(0.96, 0.25, 0.30, 1.0)
+	var line_col: Color = Color(0.95, 1.0, 0.97, 1.0) if is_on else Color(1.0, 0.86, 0.88, 1.0)
+
+	for y in range(sz):
+		for x in range(sz):
+			var fx: float = float(x) + 0.5
+			var fy: float = float(y) + 0.5
+
+			# 1) Microphone rounded capsule (cx=32, y=10..35, r=8.5)
+			var cap_cy: float = clampf(fy, 18.5, 26.5)
+			var cap_d: float = Vector2(fx - 32.0, fy - cap_cy).length()
+			if cap_d <= 8.5:
+				img.set_pixel(x, y, line_col if cap_d > 6.3 else body_col)
+
+			# 2) U-cradle arc around capsule (cx=32, cy=26.5, r=14..17.2, fy>=25)
+			if fy >= 25.0:
+				var arc_d: float = Vector2(fx - 32.0, fy - 26.5).length()
+				if arc_d >= 13.6 and arc_d <= 17.0:
+					img.set_pixel(x, y, line_col)
+
+			# 3) Stem & base
+			if fx >= 30.2 and fx <= 33.8 and fy >= 42.5 and fy <= 53.5:
+				img.set_pixel(x, y, line_col)
+			if fx >= 22.0 and fx <= 42.0 and fy >= 52.0 and fy <= 55.8:
+				img.set_pixel(x, y, line_col)
+
+			# 4) Red diagonal strike-through slash when muted (OFF)
+			if not is_on:
+				var a := Vector2(11.0, 11.0)
+				var b := Vector2(53.0, 53.0)
+				var ab: Vector2 = b - a
+				var t: float = clampf((Vector2(fx, fy) - a).dot(ab) / ab.length_squared(), 0.0, 1.0)
+				var slash_d: float = Vector2(fx, fy).distance_to(a + ab * t)
+				if slash_d <= 4.3:
+					img.set_pixel(x, y, Color(1.0, 0.14, 0.22, 1.0) if slash_d <= 2.6 else Color(1.0, 1.0, 1.0, 0.98))
+
+	return ImageTexture.create_from_image(img)
+
+
 func _build_spirit_spatial_runes() -> void:
+	tex_mic_on = _make_mic_icon_texture(true)
+	tex_mic_off = _make_mic_icon_texture(false)
+
 	spirit_runes_root = Node3D.new()
 	spirit_runes_root.name = "SpiritSpatialRunes"
 	spirit_runes_root.position = home_pos + Vector3(0.0, -0.23, 0.03)
 	add_child(spirit_runes_root)
 
 	var defs: Array[Dictionary] = [
-		{"key": "A", "label": "A 시선", "offset": Vector3(-0.172, 0.0, 0.0), "col": Color(0.20, 0.78, 0.55, 0.44)},
-		{"key": "B", "label": "B 기억", "offset": Vector3(-0.086, 0.0, 0.0), "col": Color(0.52, 0.42, 0.92, 0.44)},
-		{"key": "X", "label": "X 모드", "offset": Vector3(0.0, 0.0, 0.0), "col": Color(0.22, 0.62, 0.92, 0.44)},
-		{"key": "Y", "label": "Y 대화", "offset": Vector3(0.086, 0.0, 0.0), "col": Color(0.95, 0.55, 0.32, 0.50)},
-		{"key": "S", "label": "⚙ 설정", "offset": Vector3(0.172, 0.0, 0.0), "col": Color(0.24, 0.82, 0.88, 0.52)}
+		{"key": "A", "label": "A 시선", "offset": Vector3(-0.184, 0.0, 0.0), "w": 0.076, "col": Color(0.20, 0.78, 0.55, 0.44)},
+		{"key": "B", "label": "B 기억", "offset": Vector3(-0.098, 0.0, 0.0), "w": 0.076, "col": Color(0.52, 0.42, 0.92, 0.44)},
+		{"key": "X", "label": "X 모드", "offset": Vector3(-0.012, 0.0, 0.0), "w": 0.076, "col": Color(0.22, 0.62, 0.92, 0.44)},
+		{"key": "Y", "label": "음성 꺼짐", "offset": Vector3(0.085, 0.0, 0.0), "w": 0.098, "col": Color(0.84, 0.15, 0.21, 0.78)},
+		{"key": "S", "label": "⚙ 설정", "offset": Vector3(0.184, 0.0, 0.0), "w": 0.076, "col": Color(0.24, 0.82, 0.88, 0.52)}
 	]
 	for d: Dictionary in defs:
 		var holder := Node3D.new()
 		holder.position = d["offset"]
 		spirit_runes_root.add_child(holder)
 
-		var pill := _make_panel_bg(0.076, 0.036, d["col"], -1)
+		var pill := _make_panel_bg(float(d["w"]), 0.038, d["col"], -1)
 		holder.add_child(pill)
 
-		var lbl := _make_label(14, 0.00092, 4)
-		lbl.text = str(d["label"])
-		lbl.position = Vector3(0.0, 0.0, 0.008)
-		holder.add_child(lbl)
+		if str(d["key"]) == "Y":
+			var icon_mi := MeshInstance3D.new()
+			var iq := QuadMesh.new()
+			iq.size = Vector2(0.023, 0.023)
+			icon_mi.mesh = iq
+			voice_rune_icon_mat = StandardMaterial3D.new()
+			voice_rune_icon_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+			voice_rune_icon_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+			voice_rune_icon_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+			voice_rune_icon_mat.render_priority = 4
+			voice_rune_icon_mat.albedo_texture = tex_mic_off
+			icon_mi.material_override = voice_rune_icon_mat
+			icon_mi.position = Vector3(-0.031, 0.0, 0.008)
+			holder.add_child(icon_mi)
+
+			var vlbl := _make_label(14, 0.00090, 4)
+			vlbl.text = "음성 꺼짐"
+			vlbl.position = Vector3(0.011, 0.0, 0.008)
+			holder.add_child(vlbl)
+			voice_rune_label = vlbl
+		else:
+			var lbl := _make_label(14, 0.00092, 4)
+			lbl.text = str(d["label"])
+			lbl.position = Vector3(0.0, 0.0, 0.008)
+			holder.add_child(lbl)
 
 		rune_items.append({
 			"key": str(d["key"]),
@@ -571,10 +660,23 @@ func _build_spirit_spatial_runes() -> void:
 
 func _update_rune_highlights(hand_near: bool = false) -> void:
 	var authed: bool = companion_agent.has_configured_auth() if companion_agent != null else false
+	if voice_rune_icon_mat != null:
+		voice_rune_icon_mat.albedo_texture = tex_mic_on if voice_live_enabled else tex_mic_off
+	if voice_rune_label != null:
+		voice_rune_label.text = "음성 켜짐" if voice_live_enabled else "음성 꺼짐"
+
 	for r: Dictionary in rune_items:
 		var key: String = str(r["key"])
 		var mat: StandardMaterial3D = r["mat"]
 		var base_col: Color = r["base_col"]
+		if key == "Y":
+			var vc: Color = Color(0.10, 0.72, 0.34, 0.88) if voice_live_enabled else Color(0.82, 0.14, 0.20, 0.82)
+			if hand_near:
+				vc = vc.lightened(0.16)
+				vc.a = 0.95
+			mat.albedo_color = vc
+			continue
+
 		var active_on: bool = (
 			(key == "A" and show_vision_bbox)
 			or (key == "B" and show_memory_xray)
@@ -1035,6 +1137,10 @@ func _poll_vision_and_promotions() -> void:
 			_apply_vision_state_to_scene(latest_vision_state)
 
 	latest_auth_voice_state = companion_agent.get_auth_voice_state()
+	var polled_live: bool = bool(latest_auth_voice_state.get("voiceLiveEnabled", false))
+	if polled_live != voice_live_enabled:
+		voice_live_enabled = polled_live
+		_update_rune_highlights()
 	if spirit != null:
 		spirit.speaking_energy = 0.85 if bool(latest_auth_voice_state.get("assistantSpeaking", false)) else 0.0
 
@@ -1158,13 +1264,14 @@ func _refresh_xray_panel() -> void:
 	if not latest_auth_voice_state.is_empty():
 		var parts: Array[String] = []
 		if bool(latest_auth_voice_state.get("oauthReady", false)):
-			parts.append("OAuth(%s)" % str(latest_auth_voice_state.get("codexModel", "gpt-5.4")))
-		if bool(latest_auth_voice_state.get("apiKeyReady", false)):
-			parts.append("Realtime(%s)" % str(latest_auth_voice_state.get("realtimeState", "idle")))
-		if bool(latest_auth_voice_state.get("sktAxReady", false)):
-			parts.append("SKT-A.X-K2")
+			parts.append("OAuth(%s)" % str(latest_auth_voice_state.get("codexModel", "gpt-6.1-sol")))
+		var rt_st: String = str(latest_auth_voice_state.get("realtimeState", "off"))
+		parts.append("음성=%s" % (("켜짐·" + rt_st) if voice_live_enabled else "꺼짐"))
+		var a_route: String = str(latest_auth_voice_state.get("audioRoute", "")).strip_edges()
+		if a_route != "":
+			parts.append(a_route)
 		if parts.size() > 0:
-			auth_txt = " + ".join(PackedStringArray(parts))
+			auth_txt = " | ".join(PackedStringArray(parts))
 
 	var latest_annot: String = "실제 시선 중심에서 포착된 사물 대기 중 (가짜 시드 0건)"
 	var latest_model_badge: String = "-"
@@ -1315,7 +1422,7 @@ func _ray_hits_point(ray_origin: Vector3, ray_dir: Vector3, target_pos: Vector3,
 	return (ray_origin + n_dir * proj).distance_to(target_pos) <= radius
 
 
-func _execute_rune_key(k: String, source_tag: String = "맨손룬Y") -> void:
+func _execute_rune_key(k: String, _source_tag: String = "맨손룬음성") -> void:
 	if k == "A":
 		_action_toggle_vision_bbox()
 	elif k == "B":
@@ -1323,7 +1430,7 @@ func _execute_rune_key(k: String, source_tag: String = "맨손룬Y") -> void:
 	elif k == "X":
 		_action_toggle_demo_mode()
 	elif k == "Y":
-		_action_trigger_query(source_tag)
+		_action_toggle_voice_live()
 	elif k == "S":
 		_action_open_setup_browser()
 
@@ -1332,23 +1439,13 @@ func _process_hands_and_pointers(delta: float) -> Variant:
 	if rune_cooldown > 0.0:
 		rune_cooldown = maxf(0.0, rune_cooldown - delta)
 
-	# 왼손 X + Y 동시 1.1초 홀드 시 데모 기억·대화 리셋 (단독 Y 홀드 PTT와 절대 충돌하지 않음)
+	# 왼손 X + Y 동시 1.1초 홀드 시 데모 기억·대화 리셋
 	if left_x_held and left_y_held and not combo_reset_fired:
 		combo_reset_timer += delta
 		if combo_reset_timer >= 1.1:
 			combo_reset_fired = true
 			combo_reset_timer = 0.0
-			y_hold_timer = -1.0
-			y_ptt_active = false
 			_action_reset_demo()
-	elif y_hold_timer >= 0.0 and not left_x_held:
-		y_hold_timer += delta
-		if not y_ptt_active and y_hold_timer >= 0.38:
-			y_ptt_active = true
-			if cam_plugin != null:
-				cam_plugin.call("startPttCapture")
-			_speak_or_chime("", "pinch")
-			_show_toast("음성 듣는 중... 말하고 Y 버튼을 떼면 전송돼!", 4.5)
 
 	var left_info: Dictionary = _update_bare_hand_tracker(&"/user/hand_tracker/left", bare_hand_joints_left, false)
 	var right_info: Dictionary = _update_bare_hand_tracker(&"/user/hand_tracker/right", bare_hand_joints_right, true)

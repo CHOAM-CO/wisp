@@ -25,6 +25,7 @@ import android.media.ImageReader
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -191,7 +192,18 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
                 }
             }
         },
-        latestFrameProvider = { latestJpeg.get() }
+        latestFrameProvider = { latestJpeg.get() },
+        onLiveMicExclusiveChanged = { liveOwnsMic ->
+            if (liveOwnsMic) {
+                stopMicLoop()
+                micStatus = "gpt_live_webrtc"
+            } else {
+                stopMicLoop()
+                micRmsLevel = 0.0
+                micStatus = "muted"
+            }
+            writeHardwareStatusJson()
+        }
     )
 
     override fun getPluginName(): String = "QuestCameraPlugin"
@@ -263,14 +275,25 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     @UsedByGodot
     fun setXrActive(active: Boolean): String {
         xrSessionReady = active
-        wispRuntime.setVoiceSessionActive(active)
         if (active) {
             ensurePermissionsAndStartAsync()
         } else {
+            wispRuntime.setVoiceLiveActive(false)
             stopMicLoop()
             closeCamera()
         }
         return getStatus()
+    }
+
+    @UsedByGodot
+    fun toggleVoiceLive(): Boolean {
+        return wispRuntime.toggleVoiceLive()
+    }
+
+    @UsedByGodot
+    fun setVoiceLiveActive(active: Boolean): String {
+        wispRuntime.setVoiceLiveActive(active)
+        return if (wispRuntime.isVoiceLiveEnabled()) "on" else "off"
     }
 
     @UsedByGodot
@@ -311,8 +334,20 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     }
 
     @UsedByGodot
-    fun submitRealtimeToolOutput(callId: String, outputJson: String): String {
-        return wispRuntime.submitRealtimeToolOutput(callId, outputJson)
+    fun completeLiveHandoff(handoffId: String, answerText: String, backendLabel: String): String {
+        return wispRuntime.completeLiveHandoff(handoffId, answerText, backendLabel)
+    }
+
+    @UsedByGodot
+    fun appendConversationHistory(role: String, badge: String, text: String): String {
+        wispRuntime.appendConversationHistory(role, badge, text)
+        return "ok"
+    }
+
+    @UsedByGodot
+    fun clearConversationHistory(): String {
+        wispRuntime.clearConversationHistory()
+        return "ok"
     }
 
     @UsedByGodot
@@ -328,11 +363,6 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     @UsedByGodot
     fun popVisionUpgradesJson(): String {
         return wispRuntime.popVisionUpgradesJson()
-    }
-
-    @UsedByGodot
-    fun fetchQueryEmbeddingSync(queryText: String): String {
-        return wispRuntime.fetchQueryEmbeddingSync(queryText)
     }
 
     @UsedByGodot
@@ -374,66 +404,6 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     fun playTestChime(): String {
         playMoodChimeAsync("recommend")
         return speakerStatus
-    }
-
-    @UsedByGodot
-    fun startPttCapture(): String {
-        wispRuntime.startPttCapture()
-        return "ptt_started"
-    }
-
-    @UsedByGodot
-    fun finishPttCapture(): String {
-        val mode = wispRuntime.finishPttCapture()
-        if (mode == "need_android_stt") {
-            val ctx = context ?: run {
-                wispRuntime.pushExternalEvent("ptt_empty")
-                return "no_context"
-            }
-            Handler(Looper.getMainLooper()).post {
-                try {
-                    if (!SpeechRecognizer.isRecognitionAvailable(ctx)) {
-                        wispRuntime.pushExternalEvent("ptt_empty")
-                        return@post
-                    }
-                    val sr = SpeechRecognizer.createSpeechRecognizer(ctx)
-                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
-                        putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-                    }
-                    sr.setRecognitionListener(object : RecognitionListener {
-                        override fun onReadyForSpeech(params: Bundle?) {}
-                        override fun onBeginningOfSpeech() {}
-                        override fun onRmsChanged(rmsdB: Float) {}
-                        override fun onBufferReceived(buffer: ByteArray?) {}
-                        override fun onEndOfSpeech() {}
-                        override fun onPartialResults(partialResults: Bundle?) {}
-                        override fun onEvent(eventType: Int, params: Bundle?) {}
-                        override fun onError(error: Int) {
-                            wispRuntime.pushExternalEvent("ptt_empty")
-                            try { sr.destroy() } catch (_: Throwable) {}
-                        }
-                        override fun onResults(results: Bundle?) {
-                            val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            val top = list?.firstOrNull()?.trim() ?: ""
-                            if (top.isNotEmpty()) {
-                                wispRuntime.pushExternalEvent("ptt_transcript", top)
-                            } else {
-                                wispRuntime.pushExternalEvent("ptt_empty")
-                            }
-                            try { sr.destroy() } catch (_: Throwable) {}
-                        }
-                    })
-                    sr.startListening(intent)
-                } catch (t: Throwable) {
-                    Log.w(TAG, "Android SpeechRecognizer fallback unavailable: ${t.message}")
-                    wispRuntime.pushExternalEvent("ptt_empty")
-                }
-            }
-            return "android_stt_listening"
-        }
-        return mode
     }
 
     @UsedByGodot
@@ -503,11 +473,13 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     @UsedByGodot
     fun getMicStateJson(): String {
         val now = System.currentTimeMillis()
+        val liveActive = wispRuntime.isVoiceLiveEnabled()
+        val rmsVal = if (liveActive) wispRuntime.getLiveMicRms() else micRmsLevel
         val obj = JSONObject()
-        obj.put("status", micStatus)
-        obj.put("rms", micRmsLevel)
+        obj.put("status", if (liveActive) "gpt_live_webrtc" else micStatus)
+        obj.put("rms", rmsVal)
         obj.put("peak", micPeakAbs)
-        obj.put("voiceRecent", (now - voiceSpeakingRecentMs) < 2200L)
+        obj.put("voiceRecent", liveActive && rmsVal > 0.018 || (now - voiceSpeakingRecentMs) < 2200L)
         return obj.toString()
     }
 
@@ -630,6 +602,10 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
         if (!stdCam) missing.add(Manifest.permission.CAMERA)
         if (!headsetCam) missing.add(PERM_HEADSET_CAMERA)
         if (!recAudio) missing.add(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val btConnect = ContextCompat.checkSelfPermission(act, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+            if (!btConnect) missing.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
 
         if (missing.isNotEmpty()) {
             if (!stdCam && !headsetCam) camStatus = "perm_pending"
@@ -647,7 +623,8 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
         Log.i(TAG, "Perms (XR active=$xrSessionReady): CAMERA=$stdCam, HEADSET_CAMERA=$headsetCam, RECORD_AUDIO=$recAudio")
 
         if (recAudio) {
-            startMicLoopIfNeeded()
+            micStatus = if (wispRuntime.isVoiceLiveEnabled()) "gpt_live_webrtc" else "muted"
+            writeHardwareStatusJson()
         }
         if ((stdCam || headsetCam) && xrSessionReady) {
             startBackgroundThreads()
@@ -710,10 +687,14 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
                 pcm[i] = (sample * Short.MAX_VALUE).toInt().toShort()
             }
 
+            val useVoiceComm = wispRuntime.isUsingVoiceCommStream()
             val track = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setUsage(
+                            if (useVoiceComm) AudioAttributes.USAGE_VOICE_COMMUNICATION
+                            else AudioAttributes.USAGE_MEDIA
+                        )
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
@@ -818,7 +799,6 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
                         if (rms > 0.020) {
                             voiceSpeakingRecentMs = System.currentTimeMillis()
                         }
-                        wispRuntime.onMicPcm16Chunk(shortBuf, n, rms)
                         if (localPeak > micPeakAbs) micPeakAbs = localPeak
                         micReadChunks += 1
                         if (micReadChunks == 1 || micReadChunks % 25 == 0) {

@@ -11,6 +11,9 @@ mkdir -p builds
 if [[ -d "android/build/src/main/java/com/godot/game" ]]; then
   cp native_plugin/*.kt android/build/src/main/java/com/godot/game/
 fi
+if [[ -f "android/build/build.gradle" ]] && ! grep -q "io.github.webrtc-sdk:android" android/build/build.gradle; then
+  perl -i -pe 's|(implementation "com\.squareup\.okhttp3:okhttp:[^"]+")|$1\n    implementation "io.github.webrtc-sdk:android:137.7151.05"|' android/build/build.gradle
+fi
 
 if [[ "${1:-}" != "--skip-export" ]]; then
   echo "[1/4] Exporting standalone Wisp Quest APK via Godot 4.7.2..."
@@ -23,10 +26,11 @@ echo "[2/4] Checking connected Quest 3 via adb..."
 adb devices -l
 adb install -r builds/QuestCompanionStarter.apk
 
-echo "[3/4] Granting Camera, Microphone & Hand Tracking permissions..."
+echo "[3/4] Granting Camera, Microphone, Bluetooth & Hand Tracking permissions..."
 adb shell pm grant com.cayde.questcompanion android.permission.CAMERA || true
 adb shell pm grant com.cayde.questcompanion horizonos.permission.HEADSET_CAMERA || true
 adb shell pm grant com.cayde.questcompanion android.permission.RECORD_AUDIO || true
+adb shell pm grant com.cayde.questcompanion android.permission.BLUETOOTH_CONNECT || true
 adb shell pm grant com.cayde.questcompanion com.oculus.permission.HAND_TRACKING || true
 
 echo "[4/4] Launching Wisp Standalone MR Companion on Quest 3..."

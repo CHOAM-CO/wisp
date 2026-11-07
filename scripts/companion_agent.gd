@@ -8,6 +8,7 @@ signal assistant_replied(text: String, backend: String, from_realtime_delegate: 
 signal agent_status_changed(busy: bool, summary: String)
 signal auth_required_prompt(reason: String)
 signal web_reset_requested()
+signal voice_live_changed(enabled: bool)
 
 const MAX_TOOL_STEPS: int = 5
 const MAX_HISTORY_ITEMS: int = 34
@@ -63,7 +64,7 @@ func has_configured_auth() -> bool:
 	var parsed: Variant = JSON.parse_string(raw)
 	if parsed is Dictionary:
 		var d: Dictionary = parsed as Dictionary
-		return bool(d.get("oauthReady", false)) or bool(d.get("apiKeyReady", false)) or bool(d.get("sktAxReady", false))
+		return bool(d.get("oauthReady", false))
 	return false
 
 
@@ -105,27 +106,27 @@ func poll( _delta: float ) -> void:
 func _handle_runtime_event(evt: Dictionary) -> void:
 	var t: String = str(evt.get("type", ""))
 	match t:
-		"realtime_tool_call":
-			var call_id: String = str(evt.get("callId", ""))
-			var utterance: String = str(evt.get("userUtterance", "")).strip_edges()
-			var intent: String = str(evt.get("intent", "general"))
+		"live_handoff_requested":
+			var handoff_id: String = str(evt.get("handoffId", "")).strip_edges()
+			var utterance: String = str(evt.get("text", "")).strip_edges()
 			if utterance == "":
-				utterance = "지금 내 시선과 기억 맥락을 확인해서 답해줘."
-			request_user_turn(
-				"[실시간 음성 요청 intent=%s] %s" % [intent, utterance],
-				"",
-				call_id
-			)
+				utterance = "지금 내 시선 중심 사물과 기억 맥락을 살펴보고 답해줘."
+			var del_prompt: String = "<realtime_delegation>\n  <input>%s</input>\n</realtime_delegation>" % utterance
+			request_user_turn(del_prompt, "", handoff_id)
+		"voice_live_toggled":
+			var enabled: bool = bool(evt.get("enabled", false))
+			voice_live_changed.emit(enabled)
+			agent_status_changed.emit(is_busy, "음성 켜짐 (GPT Live)" if enabled else "음성 꺼짐")
+		"realtime_connected":
+			agent_status_changed.emit(is_busy, "GPT Live 실시간 음성 연결됨")
+		"audio_route_changed":
+			var route_lbl: String = str(evt.get("route", "")).strip_edges()
+			if route_lbl != "":
+				agent_status_changed.emit(is_busy, "오디오 전환: " + route_lbl)
 		"web_prompt":
 			var txt: String = str(evt.get("text", "")).strip_edges()
 			if txt != "":
 				request_user_turn(txt)
-		"ptt_transcript":
-			var pt_txt: String = str(evt.get("text", "")).strip_edges()
-			if pt_txt != "":
-				request_user_turn(pt_txt)
-		"ptt_empty":
-			agent_status_changed.emit(is_busy, "음성이 잘 안 들렸어. 다시 말해줘!")
 		"web_reset":
 			web_reset_requested.emit()
 		"user_transcript":
@@ -142,7 +143,7 @@ func _handle_runtime_event(evt: Dictionary) -> void:
 			if dc != "":
 				agent_status_changed.emit(false, "PC에서 auth.openai.com/codex/device 열고 코드 [" + dc + "] 입력해줘!")
 		"auth_updated":
-			agent_status_changed.emit(false, "구독 로그인 완료! 이제 편하게 말 걸어줘!")
+			agent_status_changed.emit(false, "구독 로그인 완료! 이제 음성을 켜고 편하게 말 걸어줘!")
 
 
 func _append_context_only_message(role: String, text: String) -> void:
@@ -185,14 +186,11 @@ func inject_sensory_event(
 		_trim_history()
 
 
-func request_user_turn(user_text: String, optional_crop_path: String = "", realtime_call_id: String = "") -> void:
+func request_user_turn(user_text: String, optional_crop_path: String = "", handoff_id: String = "") -> void:
 	if not has_configured_auth():
-		auth_required_prompt.emit("먼저 설정 룬(⚙)을 눌러 ChatGPT 로그인이나 API 키를 연결해줘!")
-		if realtime_call_id != "" and cam_plugin != null:
-			cam_plugin.call("submitRealtimeToolOutput", realtime_call_id, JSON.stringify({
-				"ok": false,
-				"message": "인증 설정이 아직 완료되지 않았어."
-			}))
+		auth_required_prompt.emit("먼저 설정 룬(⚙)을 눌러 ChatGPT 구독 로그인을 연결해줘!")
+		if handoff_id != "" and cam_plugin != null:
+			cam_plugin.call("completeLiveHandoff", handoff_id, "먼저 설정에서 ChatGPT 구독 로그인이 필요해.", "auth_missing")
 		return
 
 	# 진행 중인 도구 루프 턴이 있으면 큐에 넣어 function_call/output 순서가 절대 섞이지 않게 직렬화
@@ -205,14 +203,14 @@ func request_user_turn(user_text: String, optional_crop_path: String = "", realt
 		_pending_turn_queue.append({
 			"user_text": user_text,
 			"optional_crop_path": optional_crop_path,
-			"realtime_call_id": realtime_call_id
+			"handoff_id": handoff_id
 		})
 		return
 
-	_start_serialized_turn(user_text, optional_crop_path, realtime_call_id)
+	_start_serialized_turn(user_text, optional_crop_path, handoff_id)
 
 
-func _start_serialized_turn(user_text: String, optional_crop_path: String = "", realtime_call_id: String = "") -> void:
+func _start_serialized_turn(user_text: String, optional_crop_path: String = "", handoff_id: String = "") -> void:
 	var content_parts: Array = [{"type": "input_text", "text": user_text}]
 	var data_url: String = _encode_crop_data_url(optional_crop_path)
 	if data_url != "":
@@ -233,7 +231,7 @@ func _start_serialized_turn(user_text: String, optional_crop_path: String = "", 
 	_turn_seq += 1
 	active_turns[turn_id] = {
 		"step": 0,
-		"realtime_call_id": realtime_call_id,
+		"handoff_id": handoff_id,
 		"user_text": user_text
 	}
 	_dispatch_turn_step(turn_id)
@@ -246,7 +244,7 @@ func _drain_next_queued_turn() -> void:
 	_start_serialized_turn(
 		str(nxt.get("user_text", "")),
 		str(nxt.get("optional_crop_path", "")),
-		str(nxt.get("realtime_call_id", ""))
+		str(nxt.get("handoff_id", ""))
 	)
 
 
@@ -256,13 +254,10 @@ func _dispatch_turn_step(turn_id: String) -> void:
 	is_busy = true
 	agent_status_changed.emit(true, "생각 중...")
 
-	var st: Dictionary = get_auth_voice_state()
-	var include_web_search: bool = not (bool(st.get("preferSktAx", false)) and bool(st.get("sktAxReady", false)))
-
 	var payload: Dictionary = {
 		"instructions": SYSTEM_INSTRUCTIONS,
 		"input": conversation_items,
-		"tools": _build_companion_tools_schema(include_web_search)
+		"tools": _build_companion_tools_schema(true)
 	}
 	cam_plugin.call("runCompanionTurnAsync", turn_id, JSON.stringify(payload))
 
@@ -272,7 +267,7 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 	if not active_turns.has(turn_id):
 		return
 	var tstate: Dictionary = active_turns[turn_id]
-	var rt_call_id: String = str(tstate.get("realtime_call_id", ""))
+	var handoff_id: String = str(tstate.get("handoff_id", ""))
 
 	if not bool(res.get("ok", false)):
 		active_turns.erase(turn_id)
@@ -280,11 +275,8 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 		is_busy = active_turns.size() > 0 or not _pending_turn_queue.is_empty()
 		last_error = str(res.get("error", "unknown_error"))
 		agent_status_changed.emit(is_busy, "응답 오류 확인 필요")
-		if rt_call_id != "" and cam_plugin != null:
-			cam_plugin.call("submitRealtimeToolOutput", rt_call_id, JSON.stringify({
-				"ok": false,
-				"error": last_error
-			}))
+		if handoff_id != "" and cam_plugin != null:
+			cam_plugin.call("completeLiveHandoff", handoff_id, "방금 확인하는 중에 잠깐 오류가 있었어. 다시 한번 말해줘!", "error")
 		_drain_next_queued_turn()
 		return
 
@@ -359,14 +351,12 @@ func _handle_turn_step_result(res: Dictionary) -> void:
 				_last_promoted_in_turn
 			)
 
-	if rt_call_id != "" and cam_plugin != null:
-		cam_plugin.call("submitRealtimeToolOutput", rt_call_id, JSON.stringify({
-			"ok": true,
-			"companion_answer": assistant_text,
-			"backend": last_backend_used
-		}))
+	if handoff_id != "" and cam_plugin != null:
+		cam_plugin.call("completeLiveHandoff", handoff_id, assistant_text, last_backend_used)
 		assistant_replied.emit(assistant_text, last_backend_used, true)
 	else:
+		if assistant_text != "" and cam_plugin != null:
+			cam_plugin.call("appendConversationHistory", "assistant_text", "✨ 위습 (" + last_backend_used + ")", assistant_text)
 		assistant_replied.emit(assistant_text, last_backend_used, false)
 
 	agent_status_changed.emit(is_busy, assistant_text if assistant_text != "" else "함께 보고 있어")
