@@ -132,6 +132,11 @@ void fragment() {
 	float wake_rim = v_carve * (1.0 - v_carve * 0.55) * 0.65;
 	col += core_color * wake_rim;
 
-	ALBEDO = col * glow_boost;
+	vec3 boosted = col * glow_boost;
+	float max_c = max(boosted.r, max(boosted.g, boosted.b));
+	if (max_c > 1.0) {
+		boosted = mix(boosted / max_c, min(boosted, vec3(1.0)), 0.28);
+	}
+	ALBEDO = boosted;
 	ALPHA = final_alpha;
 }

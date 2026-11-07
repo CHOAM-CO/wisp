@@ -103,7 +103,20 @@ class WispStandaloneRuntime(
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
-    private val workerPool = Executors.newCachedThreadPool()
+    private val workerPool = Executors.newCachedThreadPool { runnable ->
+        Thread({
+            try {
+                runnable.run()
+            } catch (t: Throwable) {
+                Log.w(TAG, "Background worker caught throwable: ${t.javaClass.simpleName}: ${t.message}")
+            }
+        }, "WispBgWorker").apply {
+            isDaemon = true
+            uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, e ->
+                Log.w(TAG, "WispBgWorker uncaught exception: ${e.message}")
+            }
+        }
+    }
 
     // Loopback HTTP server
     private val serverRunning = AtomicBoolean(false)
@@ -1427,141 +1440,147 @@ class WispStandaloneRuntime(
     }
 
     private fun handleHttpClient(socket: Socket) {
-        socket.use { sock ->
-            sock.soTimeout = 10000
-            val inp = sock.getInputStream()
-            val reqLine = readHttpHeaderLine(inp) ?: return
-            val parts = reqLine.split(" ")
-            if (parts.size < 2) return
-            val method = parts[0].uppercase()
-            val fullTarget = parts[1]
-            val qIdx = fullTarget.indexOf('?')
-            val path = if (qIdx >= 0) fullTarget.substring(0, qIdx) else fullTarget
-            val queryStr = if (qIdx >= 0) fullTarget.substring(qIdx + 1) else ""
+        try {
+            socket.use { sock ->
+                sock.soTimeout = 10000
+                val inp = sock.getInputStream()
+                val reqLine = readHttpHeaderLine(inp) ?: return
+                val parts = reqLine.split(" ")
+                if (parts.size < 2) return
+                val method = parts[0].uppercase()
+                val fullTarget = parts[1]
+                val qIdx = fullTarget.indexOf('?')
+                val path = if (qIdx >= 0) fullTarget.substring(0, qIdx) else fullTarget
+                val queryStr = if (qIdx >= 0) fullTarget.substring(qIdx + 1) else ""
 
-            var contentLen = 0
-            while (true) {
-                val h = readHttpHeaderLine(inp) ?: break
-                if (h.isEmpty()) break
-                if (h.startsWith("Content-Length:", ignoreCase = true)) {
-                    contentLen = h.substringAfter(":").trim().toIntOrNull() ?: 0
+                var contentLen = 0
+                while (true) {
+                    val h = readHttpHeaderLine(inp) ?: break
+                    if (h.isEmpty()) break
+                    if (h.startsWith("Content-Length:", ignoreCase = true)) {
+                        contentLen = h.substringAfter(":").trim().toIntOrNull() ?: 0
+                    }
+                }
+
+                val bodyStr = if (contentLen in 1..262144) {
+                    val buf = ByteArray(contentLen)
+                    var readTotal = 0
+                    while (readTotal < contentLen) {
+                        val r = inp.read(buf, readTotal, contentLen - readTotal)
+                        if (r <= 0) break
+                        readTotal += r
+                    }
+                    String(buf, 0, readTotal, Charsets.UTF_8)
+                } else ""
+
+                when {
+                    method == "GET" && (path == "/" || path == "/setup") -> {
+                        val params = parseFormEncoded(queryStr)
+                        val html = renderSetupHtml(params["msg"] ?: "")
+                        writeHttpResponse(sock, "200 OK", "text/html; charset=utf-8", html.toByteArray(Charsets.UTF_8))
+                    }
+                    method == "GET" && path == "/auth/start" -> {
+                        val rnd = ByteArray(32).also { SecureRandom().nextBytes(it) }
+                        val verifier = Base64.encodeToString(rnd, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+                        val digest = MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray(Charsets.US_ASCII))
+                        val challenge = Base64.encodeToString(digest, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+                        val stateBytes = ByteArray(16).also { SecureRandom().nextBytes(it) }
+                        val state = Base64.encodeToString(stateBytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+                        pkceVerifier = verifier
+                        pkceState = state
+
+                        val authUrl = "$AUTHORIZE_URL?response_type=code" +
+                            "&client_id=${URLEncoder.encode(CLIENT_ID, "UTF-8")}" +
+                            "&redirect_uri=${URLEncoder.encode(REDIRECT_URI, "UTF-8")}" +
+                            "&scope=${URLEncoder.encode("openid profile email offline_access", "UTF-8")}" +
+                            "&code_challenge=${URLEncoder.encode(challenge, "UTF-8")}" +
+                            "&code_challenge_method=S256" +
+                            "&id_token_add_organizations=true" +
+                            "&codex_cli_simplified_flow=true" +
+                            "&state=${URLEncoder.encode(state, "UTF-8")}" +
+                            "&originator=codex_cli_rs"
+                        writeRedirect(sock, authUrl)
+                    }
+                    method == "GET" && path == "/auth/callback" -> {
+                        val params = parseFormEncoded(queryStr)
+                        val code = params["code"] ?: ""
+                        val state = params["state"] ?: ""
+                        if (code.isBlank() || (pkceState.isNotBlank() && state != pkceState)) {
+                            writeRedirect(sock, "/setup?msg=oauth_state_err")
+                            return
+                        }
+                        val ok = exchangePkceCode(code, pkceVerifier)
+                        if (ok) {
+                            workerPool.execute { refreshCatalogModelSafe() }
+                            pushRuntimeEvent("auth_updated") { put("source", "oauth_pkce") }
+                            writeRedirect(sock, "/setup?msg=oauth_ok")
+                        } else {
+                            writeRedirect(sock, "/setup?msg=oauth_exchange_err")
+                        }
+                    }
+                    method == "POST" && path == "/setup/save" -> {
+                        val form = parseFormEncoded(bodyStr)
+                        val authJsonRaw = (form["auth_json"] ?: "").trim()
+                        val openAiKey = (form["openai_api_key"] ?: "").trim()
+                        val sktKey = (form["skt_ax_key"] ?: "").trim()
+                        val selectedModel = (form["codex_model"] ?: "").trim()
+                        val preferAx = (form["prefer_skt_ax"] == "on")
+
+                        if (authJsonRaw.isNotEmpty()) {
+                            importAuthJsonString(authJsonRaw)
+                        }
+                        synchronized(authLock) {
+                            if (selectedModel.isNotEmpty()) {
+                                auth.codexModel = selectedModel
+                            }
+                            if (openAiKey.isNotEmpty() && !openAiKey.contains("••••")) {
+                                auth.openaiApiKey = openAiKey
+                            }
+                            if (sktKey.isNotEmpty() && !sktKey.contains("••••")) {
+                                auth.sktAxApiKey = sktKey
+                            }
+                            auth.preferSktAx = preferAx
+                        }
+                        saveAuthToDisk()
+                        disconnectRealtime()
+                        if (realtimeDesired.get()) {
+                            ensureRealtimeConnectedIfConfigured()
+                        }
+                        pushRuntimeEvent("auth_updated") { put("source", "setup_form") }
+                        writeRedirect(sock, "/setup?msg=saved")
+                    }
+                    method == "POST" && path == "/setup/say" -> {
+                        val form = parseFormEncoded(bodyStr)
+                        val prompt = (form["prompt"] ?: "").trim()
+                        if (prompt.isNotEmpty()) {
+                            lastUserTranscript = prompt
+                            pushRuntimeEvent("web_prompt") { put("text", prompt) }
+                        }
+                        writeRedirect(sock, "/setup?msg=sent")
+                    }
+                    method == "POST" && path == "/setup/reset" -> {
+                        pushRuntimeEvent("web_reset") {}
+                        writeRedirect(sock, "/setup?msg=reset_ok")
+                    }
+                    method == "POST" && path == "/setup/logout" -> {
+                        synchronized(authLock) { auth = StoredAuth() }
+                        saveAuthToDisk()
+                        disconnectRealtime()
+                        pushRuntimeEvent("auth_updated") { put("source", "logout") }
+                        writeRedirect(sock, "/setup?msg=cleared")
+                    }
+                    method == "GET" && path == "/api/status" -> {
+                        writeHttpResponse(sock, "200 OK", "application/json; charset=utf-8", getStateJson().toByteArray(Charsets.UTF_8))
+                    }
+                    else -> {
+                        writeRedirect(sock, "/setup")
+                    }
                 }
             }
-
-            val bodyStr = if (contentLen in 1..262144) {
-                val buf = ByteArray(contentLen)
-                var readTotal = 0
-                while (readTotal < contentLen) {
-                    val r = inp.read(buf, readTotal, contentLen - readTotal)
-                    if (r <= 0) break
-                    readTotal += r
-                }
-                String(buf, 0, readTotal, Charsets.UTF_8)
-            } else ""
-
-            when {
-                method == "GET" && (path == "/" || path == "/setup") -> {
-                    val params = parseFormEncoded(queryStr)
-                    val html = renderSetupHtml(params["msg"] ?: "")
-                    writeHttpResponse(sock, "200 OK", "text/html; charset=utf-8", html.toByteArray(Charsets.UTF_8))
-                }
-                method == "GET" && path == "/auth/start" -> {
-                    val rnd = ByteArray(32).also { SecureRandom().nextBytes(it) }
-                    val verifier = Base64.encodeToString(rnd, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
-                    val digest = MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray(Charsets.US_ASCII))
-                    val challenge = Base64.encodeToString(digest, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
-                    val stateBytes = ByteArray(16).also { SecureRandom().nextBytes(it) }
-                    val state = Base64.encodeToString(stateBytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
-                    pkceVerifier = verifier
-                    pkceState = state
-
-                    val authUrl = "$AUTHORIZE_URL?response_type=code" +
-                        "&client_id=${URLEncoder.encode(CLIENT_ID, "UTF-8")}" +
-                        "&redirect_uri=${URLEncoder.encode(REDIRECT_URI, "UTF-8")}" +
-                        "&scope=${URLEncoder.encode("openid profile email offline_access", "UTF-8")}" +
-                        "&code_challenge=${URLEncoder.encode(challenge, "UTF-8")}" +
-                        "&code_challenge_method=S256" +
-                        "&id_token_add_organizations=true" +
-                        "&codex_cli_simplified_flow=true" +
-                        "&state=${URLEncoder.encode(state, "UTF-8")}" +
-                        "&originator=codex_cli_rs"
-                    writeRedirect(sock, authUrl)
-                }
-                method == "GET" && path == "/auth/callback" -> {
-                    val params = parseFormEncoded(queryStr)
-                    val code = params["code"] ?: ""
-                    val state = params["state"] ?: ""
-                    if (code.isBlank() || (pkceState.isNotBlank() && state != pkceState)) {
-                        writeRedirect(sock, "/setup?msg=oauth_state_err")
-                        return
-                    }
-                    val ok = exchangePkceCode(code, pkceVerifier)
-                    if (ok) {
-                        workerPool.execute { refreshCatalogModelSafe() }
-                        pushRuntimeEvent("auth_updated") { put("source", "oauth_pkce") }
-                        writeRedirect(sock, "/setup?msg=oauth_ok")
-                    } else {
-                        writeRedirect(sock, "/setup?msg=oauth_exchange_err")
-                    }
-                }
-                method == "POST" && path == "/setup/save" -> {
-                    val form = parseFormEncoded(bodyStr)
-                    val authJsonRaw = (form["auth_json"] ?: "").trim()
-                    val openAiKey = (form["openai_api_key"] ?: "").trim()
-                    val sktKey = (form["skt_ax_key"] ?: "").trim()
-                    val selectedModel = (form["codex_model"] ?: "").trim()
-                    val preferAx = (form["prefer_skt_ax"] == "on")
-
-                    if (authJsonRaw.isNotEmpty()) {
-                        importAuthJsonString(authJsonRaw)
-                    }
-                    synchronized(authLock) {
-                        if (selectedModel.isNotEmpty()) {
-                            auth.codexModel = selectedModel
-                        }
-                        if (openAiKey.isNotEmpty() && !openAiKey.contains("••••")) {
-                            auth.openaiApiKey = openAiKey
-                        }
-                        if (sktKey.isNotEmpty() && !sktKey.contains("••••")) {
-                            auth.sktAxApiKey = sktKey
-                        }
-                        auth.preferSktAx = preferAx
-                    }
-                    saveAuthToDisk()
-                    disconnectRealtime()
-                    if (realtimeDesired.get()) {
-                        ensureRealtimeConnectedIfConfigured()
-                    }
-                    pushRuntimeEvent("auth_updated") { put("source", "setup_form") }
-                    writeRedirect(sock, "/setup?msg=saved")
-                }
-                method == "POST" && path == "/setup/say" -> {
-                    val form = parseFormEncoded(bodyStr)
-                    val prompt = (form["prompt"] ?: "").trim()
-                    if (prompt.isNotEmpty()) {
-                        lastUserTranscript = prompt
-                        pushRuntimeEvent("web_prompt") { put("text", prompt) }
-                    }
-                    writeRedirect(sock, "/setup?msg=sent")
-                }
-                method == "POST" && path == "/setup/reset" -> {
-                    pushRuntimeEvent("web_reset") {}
-                    writeRedirect(sock, "/setup?msg=reset_ok")
-                }
-                method == "POST" && path == "/setup/logout" -> {
-                    synchronized(authLock) { auth = StoredAuth() }
-                    saveAuthToDisk()
-                    disconnectRealtime()
-                    pushRuntimeEvent("auth_updated") { put("source", "logout") }
-                    writeRedirect(sock, "/setup?msg=cleared")
-                }
-                method == "GET" && path == "/api/status" -> {
-                    writeHttpResponse(sock, "200 OK", "application/json; charset=utf-8", getStateJson().toByteArray(Charsets.UTF_8))
-                }
-                else -> {
-                    writeRedirect(sock, "/setup")
-                }
-            }
+        } catch (_: java.net.SocketTimeoutException) {
+            // Quest Browser / Chrome opens idle preconnect sockets that time out quietly; ignore.
+        } catch (t: Throwable) {
+            Log.d(TAG, "Loopback HTTP socket closed: ${t.javaClass.simpleName}: ${t.message}")
         }
     }
 

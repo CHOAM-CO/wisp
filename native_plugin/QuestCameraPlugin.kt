@@ -519,12 +519,18 @@ class QuestCameraPlugin(godot: Godot) : GodotPlugin(godot) {
     private fun startBackgroundThreads() {
         if (cameraThread == null) {
             cameraThread = HandlerThread("QuestPassthroughCam").also {
+                it.uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, e ->
+                    Log.w(TAG, "QuestPassthroughCam caught exception: ${e.message}")
+                }
                 it.start()
                 cameraHandler = Handler(it.looper)
             }
         }
         if (visionThread == null) {
             visionThread = HandlerThread("QuestVisionWorker").also {
+                it.uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, e ->
+                    Log.w(TAG, "QuestVisionWorker caught exception: ${e.message}")
+                }
                 it.start()
                 visionHandler = Handler(it.looper)
             }

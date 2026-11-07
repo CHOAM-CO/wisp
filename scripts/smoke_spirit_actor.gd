@@ -734,12 +734,15 @@ func _update_motes_and_colors(_delta: float) -> void:
 	elif mood_override == "curious":
 		gaze_em = maxf(gaze_em, 0.85)
 
-	core_col = core_col.lerp(Color(0.38, 1.0, 0.72), gaze_em * 0.65)
-	core_col = core_col.lerp(Color(1.0, 0.90, 0.48), gold_mem * 0.82)
-	core_col = core_col.lerp(Color(0.75, 1.0, 0.96), warm_touch * 0.55)
+	core_col = core_col.lerp(Color(0.24, 0.96, 0.62), gaze_em * 0.72)
+	core_col = core_col.lerp(Color(1.0, 0.82, 0.30), gold_mem * 0.88)
+	core_col = core_col.lerp(Color(0.62, 0.95, 1.0), warm_touch * 0.48)
 
-	mid_col = mid_col.lerp(Color(0.95, 0.72, 0.28), gold_mem * 0.75)
-	mid_col = mid_col.lerp(Color(0.45, 0.95, 0.92), warm_touch * 0.60)
+	mid_col = mid_col.lerp(Color(0.14, 0.78, 0.52), gaze_em * 0.65)
+	mid_col = mid_col.lerp(Color(0.95, 0.58, 0.16), gold_mem * 0.85)
+	mid_col = mid_col.lerp(Color(0.32, 0.82, 0.98), warm_touch * 0.60)
+
+	mist_col = mist_col.lerp(Color(0.96, 0.78, 0.42), gold_mem * 0.65)
 
 	var glow: float = 1.22 + speak_boost * 0.42 + warm_touch * 0.25 + gold_mem * 0.28 + (0.22 if fleeing_now else 0.0)
 	core_mat.set_shader_parameter("core_color", Vector3(core_col.r, core_col.g, core_col.b))
