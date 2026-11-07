@@ -1,0 +1,14 @@
+# Godot 4+
+.godot/
+*.translation
+
+# Android unpacked build template & outputs
+android/build/
+android/.gradle/
+builds/*.apk
+builds/*.aab
+builds/*.idsig
+
+# macOS / IDE
+.DS_Store
+*.swp
